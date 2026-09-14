@@ -1,0 +1,7 @@
+# keep the build context lean: local DBs, build outputs, logs
+*.db
+*.db-shm
+*.db-wal
+*.exe
+*.log
+dist/

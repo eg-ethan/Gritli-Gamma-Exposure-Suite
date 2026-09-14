@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GEX Suite</title>
+<link rel="stylesheet" href="/assets/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23111827'/><rect x='3' y='8' width='2.4' height='5' fill='%23ef4444'/><rect x='6.8' y='4' width='2.4' height='9' fill='%2322c55e'/><rect x='10.6' y='6' width='2.4' height='7' fill='%233b82f6'/></svg>">
+</head>
+<body>
+<!-- Fixed sweeper banner: yellow at 60s cadences, red when any 15s ticker is
+     armed (its cost is a floor). Shifts the app down while visible. -->
+<div id="sweep-banner" class="sweep-banner hidden"></div>
+<div id="app">
+
+  <!-- ══════════ Header ══════════ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◧</span>
+      <span class="brand-name">GEX Suite</span>
+    </div>
+
+    <nav class="view-tabs" role="tablist">
+      <button class="tab active" id="tab-gex" data-view="gex">Gamma Exposure</button>
+      <button class="tab" id="tab-oi" data-view="oi">Open Interest</button>
+    </nav>
+
+    <div class="topbar-right">
+      <div id="live-badge" class="badge badge-off" title="Data stream status">
+        <span class="dot"></span><span id="live-label">SNAPSHOT</span>
+      </div>
+      <button id="master-btn" class="btn btn-connect">Connect</button>
+    </div>
+  </header>
+
+  <!-- ══════════ Watchlist strip ══════════ -->
+  <nav class="ticker-strip" id="ticker-strip" aria-label="Watchlist"></nav>
+  <form id="custom-form" class="custom-form hidden" autocomplete="off">
+    <input id="custom-input" maxlength="10" placeholder="TICKER" aria-label="Custom ticker" spellcheck="false">
+    <button type="submit" class="btn btn-connect small">Set</button>
+    <button type="button" id="custom-cancel" class="btn btn-ghost small">Cancel</button>
+    <span class="muted small">free slot — replaces the current custom ticker</span>
+  </form>
+
+  <!-- ══════════ Ticker + quote strip ══════════ -->
+  <section class="quoterow">
+    <div class="panel ticker-panel">
+      <input id="ticker-input" class="ticker-input" value="SPY" spellcheck="false" aria-label="Ticker">
+      <div class="seg" role="group" aria-label="GEX view">
+        <button class="seg-btn active" data-gexmode="net">Net GEX</button>
+        <button class="seg-btn" data-gexmode="callput">Call/Put</button>
+      </div>
+      <div class="seg" role="group" aria-label="Render mode">
+        <button class="seg-btn active" data-render="graph">Graph</button>
+        <button class="seg-btn" data-render="table">Table</button>
+      </div>
+    </div>
+
+    <div class="panel exp-tiles">
+      <div class="tile"><div class="tile-label">ODTE</div><div class="tile-value" id="tile-odte">—</div></div>
+      <div class="tile"><div class="tile-label">Weekly</div><div class="tile-value" id="tile-weekly">—</div></div>
+      <div class="tile"><div class="tile-label">Monthly</div><div class="tile-value" id="tile-monthly">—</div></div>
+    </div>
+
+    <div class="panel quote-panel">
+      <div class="quote-main">
+        <div><span id="quote-ticker" class="quote-ticker">—</span><span id="quote-contracts" class="muted"></span></div>
+        <div class="quote-price-row">
+          <span id="quote-price" class="quote-price">—</span>
+          <span id="quote-chg" class="quote-chg"></span>
+        </div>
+      </div>
+      <div class="quote-meta">
+        <div><span class="muted">Baseline IV</span><span id="quote-iv">—</span></div>
+        <div><span class="muted">Expiries</span><span id="quote-expiries">—</span></div>
+        <div><span class="muted">Updated</span><span id="quote-updated">—</span></div>
+      </div>
+      <label class="expiry-select-wrap">
+        <span class="muted">Expiration</span>
+        <select id="expiry-select" aria-label="Expiration filter">
+          <option value="all">All expirations</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <!-- ══════════ Stats row ══════════ -->
+  <section class="statsrow" id="statsrow">
+    <div class="stat"><div class="stat-label">Spot Price</div><div class="stat-value" id="st-spot">—</div></div>
+    <div class="stat"><div class="stat-label">Net GEX</div><div class="stat-value" id="st-net">—</div><div class="stat-sub muted" id="st-regime"></div></div>
+    <div class="stat"><div class="stat-label">Call GEX</div><div class="stat-value pos" id="st-call">—</div></div>
+    <div class="stat"><div class="stat-label">Put GEX</div><div class="stat-value neg" id="st-put">—</div></div>
+    <div class="stat"><div class="stat-label">Total GEX</div><div class="stat-value" id="st-total">—</div></div>
+    <div class="stat"><div class="stat-label">Call Wall</div><div class="stat-value pos" id="st-callwall">—</div><div class="stat-sub muted" id="st-callwall-dist"></div></div>
+    <div class="stat"><div class="stat-label">Put Wall</div><div class="stat-value neg" id="st-putwall">—</div><div class="stat-sub muted" id="st-putwall-dist"></div></div>
+    <div class="stat"><div class="stat-label">Zero Gamma</div><div class="stat-value" id="st-flip">—</div><div class="stat-sub muted" id="st-flip-dist"></div></div>
+  </section>
+
+  <!-- ══════════ Per-class segregation strip (multi-class index chains) ══════════ -->
+  <section class="panel class-strip hidden" id="panel-classes">
+    <div class="panel-head">
+      <h2><span class="accent">▎</span>Exposure by Settlement Class</h2>
+      <span class="muted small">AM / PM-settled listings kept comparable, not blended</span>
+    </div>
+    <div class="class-cards" id="class-cards"></div>
+  </section>
+
+  <!-- ══════════ Main grid ══════════ -->
+  <main class="maingrid">
+
+    <div class="col-main">
+
+      <!-- Strike Profile -->
+      <section class="panel" id="panel-strike">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>Strike Profile</h2>
+          <div class="panel-tools">
+            <div class="seg" role="group" aria-label="Strike range">
+              <button class="seg-btn active" data-range="all">All</button>
+              <button class="seg-btn" data-range="near">Near</button>
+            </div>
+          </div>
+        </div>
+        <div class="panel-body">
+          <canvas id="chart-strike" height="300"></canvas>
+          <div id="strike-table" class="table-wrap hidden"></div>
+        </div>
+        <div class="legend">
+          <span class="lg"><i class="swatch pos"></i>Call GEX</span>
+          <span class="lg"><i class="swatch neg"></i>Put GEX</span>
+          <span class="lg"><i class="swatch spot"></i>Spot</span>
+        </div>
+      </section>
+
+      <!-- Gamma Price Profile -->
+      <section class="panel" id="panel-profile">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>Gamma Price Profile</h2>
+          <span class="muted small" id="profile-note">Projected total GEX at different spot levels (constant IV)</span>
+        </div>
+        <div class="panel-body">
+          <canvas id="chart-profile" height="220"></canvas>
+        </div>
+      </section>
+
+      <!-- Volatility Skew -->
+      <section class="panel" id="panel-skew">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>Volatility Skew</h2>
+          <span class="muted small" id="skew-note">quoted IV by strike · 25Δ / 50Δ / 75Δ marked</span>
+        </div>
+        <div class="skew-stats" id="skew-stats"></div>
+        <div class="panel-body">
+          <canvas id="chart-skew" height="240"></canvas>
+        </div>
+        <div class="legend">
+          <span class="lg"><i class="swatch pos"></i>Call IV</span>
+          <span class="lg"><i class="swatch neg"></i>Put IV</span>
+          <span class="lg"><i class="swatch spot"></i>Spot</span>
+          <span class="lg"><i class="swatch mark"></i>Δ25 / Δ50 / Δ75</span>
+        </div>
+      </section>
+
+      <!-- GEX Heatmap by Expiration -->
+      <section class="panel" id="panel-heatmap">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>GEX Heatmap by Expiration</h2>
+          <div class="panel-tools">
+            <div class="scale-legend">
+              <span class="muted small">Put-heavy</span>
+              <div class="scale-bar"></div>
+              <span class="muted small">Call-heavy</span>
+            </div>
+            <button id="heat-toggle" class="btn btn-ghost small">view all</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="table-wrap heat-wrap">
+            <table class="heatmap" id="heat-table"></table>
+          </div>
+          <div class="muted small heat-foot" id="heat-foot"></div>
+        </div>
+      </section>
+
+      <!-- OI view (tab) -->
+      <section class="panel hidden" id="panel-oi">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>Open Interest by Strike</h2>
+          <span class="muted small">Dealer inventory baseline (OI-baseline convention)</span>
+        </div>
+        <div class="panel-body">
+          <canvas id="chart-oi" height="300"></canvas>
+        </div>
+        <div class="legend">
+          <span class="lg"><i class="swatch pos"></i>Call OI</span>
+          <span class="lg"><i class="swatch neg"></i>Put OI</span>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- ══════════ Right rail ══════════ -->
+    <aside class="col-rail">
+
+      <!-- Stream control -->
+      <section class="panel" id="panel-streams">
+        <div class="panel-head"><h2><span class="accent">▎</span>Data Streams</h2></div>
+        <div class="panel-body stream-body">
+          <div class="stream-row">
+            <label class="switch-label"><input type="checkbox" id="stream-underlying"><span>Underlying ticks</span></label>
+            <span class="stream-state" id="state-underlying">off</span>
+          </div>
+          <div class="stream-row">
+            <label class="switch-label"><input type="checkbox" id="stream-options"><span>Option chain / OI</span></label>
+            <span class="stream-state" id="state-options">off</span>
+          </div>
+          <div class="stream-stats muted small">
+            <div><span>Mode</span><span id="stream-mode">synthetic</span></div>
+            <div><span>Updates</span><span id="stream-updates">0</span></div>
+            <div><span>Last tick</span><span id="stream-last">—</span></div>
+            <div><span>Saved as of</span><span id="stream-saved">—</span></div>
+          </div>
+          <div class="hint muted small" id="stream-hint">Disconnect to freeze the view: the strike profile and the expiration table keep rendering from the saved state, no live feed needed.</div>
+        </div>
+      </section>
+
+      <!-- Snapshot Sweeper (GUI-controlled, max 2, cost-guarded) -->
+      <section class="panel hidden" id="panel-sweeper">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>Snapshot Sweeper</h2>
+          <span class="muted small" id="sweep-cap-hint">max 2 · never auto-starts</span>
+        </div>
+        <div class="panel-body stream-body">
+          <div id="sweeper-rows"></div>
+          <div class="stream-stats muted small">
+            <div><span>Metered spend</span><span id="sweep-spend">$0.00</span></div>
+            <div><span>Edge sweeping</span><span id="sweep-live">—</span></div>
+          </div>
+          <div class="hint muted small">Sweeps cost ~$0.01 per snapshot and never start on their own — each ticker arms only by your toggle, max 2, and stops (sticky) at its shutoff window. The $0 spot feed is separate and stays untouched.</div>
+          <div id="sweep-error" class="sweep-error hidden"></div>
+        </div>
+      </section>
+
+      <!-- Ingest diagnostics (edge mode) -->
+      <section class="panel hidden" id="panel-diag">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>Ingest Diagnostics</h2>
+          <span class="muted small" id="diag-uptime"></span>
+        </div>
+        <div class="panel-body stream-body">
+          <div class="stream-stats muted small" id="diag-counters">
+            <div><span>Events</span><span id="diag-events">—</span></div>
+            <div><span>Seq gaps</span><span id="diag-gaps">—</span></div>
+            <div><span>Malformed</span><span id="diag-malformed">—</span></div>
+            <div><span>Rejected</span><span id="diag-rejected">—</span></div>
+            <div><span>Feed age</span><span id="diag-latency">—</span></div>
+            <div><span>DB failures</span><span id="diag-db">—</span></div>
+          </div>
+          <div class="diag-anoms" id="diag-anoms">
+            <div class="muted small">No anomalies.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Intraday ΔGEX -->
+      <section class="panel" id="panel-dgex">
+        <div class="panel-head"><h2><span class="accent">▎</span>Intraday ΔGEX</h2></div>
+        <div class="panel-body">
+          <div class="dgex-stats">
+            <div class="tile"><div class="tile-label">Δ Session</div><div class="tile-value" id="dgex-session">—</div></div>
+            <div class="tile"><div class="tile-label">Δ Recent</div><div class="tile-value" id="dgex-recent">—</div></div>
+          </div>
+          <canvas id="chart-dgex" height="150"></canvas>
+        </div>
+      </section>
+
+      <!-- Signals -->
+      <section class="panel" id="panel-signals">
+        <div class="panel-head"><h2><span class="accent">▎</span>Signals</h2></div>
+        <div class="panel-body" id="signals-body">
+          <div class="muted small">Connect a stream or load a saved snapshot.</div>
+        </div>
+      </section>
+
+      <!-- Squeeze screener -->
+      <section class="panel" id="panel-squeeze">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>Gamma Squeeze Screener</h2>
+        </div>
+        <div class="panel-body" id="squeeze-body">
+          <div class="muted small">Heuristic score — needs a snapshot.</div>
+        </div>
+      </section>
+
+    </aside>
+  </main>
+
+  <footer class="foot muted small">
+    <span id="foot-conn"></span>
+    <span>GEX Suite · synthetic demo feed · not investment advice</span>
+  </footer>
+</div>
+
+<!-- Fixed red kill pill (bottom-left): one click deselects every sweep. -->
+<button id="sweep-kill" class="sweep-kill hidden" type="button">⛔ KILL ALL SWEEPS</button>
+<!-- Fixed master-log countdown (bottom-right): ticks to the next CSV flush. -->
+<div id="master-countdown" class="master-countdown hidden"></div>
+
+<noscript><div class="noscript">GEX Suite needs JavaScript.</div></noscript>
+<script src="/assets/app.js"></script>
+</body>
+</html>

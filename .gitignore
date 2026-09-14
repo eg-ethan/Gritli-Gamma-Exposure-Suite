@@ -1,0 +1,26 @@
+# toolchain / build output
+.tools/
+**/bin/
+**/obj/
+core/dist/
+*.exe
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# local data / journals / logs (captured market data — do not publish)
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+*.log
+*.csv
+
+# personal tool state
+.obsidian/
+.zcode/
+
+# third-party copyrighted material
+.firecrawl/
+ssrn-PDTS.pdf

@@ -1,0 +1,8 @@
+{
+  "ticker": "SPY",
+  "dist": "t",
+  "n_obs": 2500,
+  "units": "percent",
+  "params": {"omega": 0.0352, "alpha": [0.082], "gamma": [0.064], "beta": [0.855]},
+  "last_state": {"h": 0.81, "eps": -0.42}
+}

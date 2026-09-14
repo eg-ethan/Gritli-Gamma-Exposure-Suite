@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>GexEdge</RootNamespace>
+    <AssemblyName>gex-edge</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- single-file publish keeps the "one download per OS" delivery posture;
+         DisableSelfContained lets the test project reference this exe
+         (dotnet run with -p:DisableSelfContained=true) -->
+    <PublishSingleFile Condition="'$(DisableSelfContained)' != 'true'">true</PublishSingleFile>
+    <SelfContained Condition="'$(DisableSelfContained)' != 'true'">true</SelfContained>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- IBKR TWS API 10.19.1 (architecture.md §1: the only C# component).
+         IB publishes no official NuGet package; IB.Api 10.19.1 is the
+         community repackage of the official CSharpAPI.dll at this version. -->
+    <PackageReference Include="IB.Api" Version="10.19.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>
