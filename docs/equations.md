@@ -17,7 +17,7 @@ $$\\bar{\\sigma}\_{\\text{GARCH}}(T) \= \\sqrt{\\frac{1}{T} \\sum\_{k=1}^T E\_t\
              \+----------------------------------+        \+----------------------------------+  
              |   GARCH-Scaled Microstructure    |        |  High-Frequency Liquidity Layer  |  
              | \- Lee-Ready Aggressor Classifier |        | \- Cont-Kukanov-Stoikov OFI       |  
-             | \- BVC scaled by $\\sigma\_{t,\\text{GARCH}}$|        | \- Kyle's $\\lambda$ Price Impact  |  
+        | \- BVC scaled by $\\sigma\_{t,\\text{GARCH}}$|        | \- Kyle's $\\lambda$ Price Impact  |  
              \+----------------------------------+        \+----------------------------------+  
                                       |                                   |  
                                Signed Volume                        Absorptive Depth  

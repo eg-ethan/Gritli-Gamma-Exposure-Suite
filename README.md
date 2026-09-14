@@ -56,7 +56,7 @@ go build -o gexctl ./cmd/gexctl
 ./gexctl serve --edge-sim
 ```
 
-Then open http://127.0.0.1:8787.
+Then open http://127.0.0.1:8787. You can change the port through Trader Workstation -> file -? global preferences -> API settings
 
 ### Before connecting a real account
 
