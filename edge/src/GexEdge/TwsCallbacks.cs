@@ -21,9 +21,13 @@ public sealed class TwsCallbacks : DefaultEWrapper
     private static readonly ConcurrentDictionary<int, PendingParams> Pending = new();
     // reqId → in-flight reqContractDetails accumulation
     private static readonly ConcurrentDictionary<int, PendingDetailsReq> PendingDetails = new();
-    // reqId → in-flight UNDERLYING conId resolution — reqSecDefOptParams
-    // needs the real conId (0 is rejected with error 321 for indices)
-    private static readonly ConcurrentDictionary<int, TaskCompletionSource<long>> PendingUnderlying = new();
+    // reqId → in-flight UNDERLYING definition resolution — reqSecDefOptParams
+    // needs the real conId (0 is rejected with error 321 for indices). The
+    // request is UNPINNED for indices on purpose: TWS may define one index on
+    // several pits (NDX on CBOE and NASDAQ), and Symbol+IND+CBOE alone dies
+    // with error 200 on some accounts — every returned row is collected and
+    // the picker below resolves the ambiguity deterministically.
+    private static readonly ConcurrentDictionary<int, PendingUnderlyingReq> PendingUnderlying = new();
     // reqId → in-flight boot-spot snapshot (chain discovery needs the
     // live underlying so selection centers on the market, not a seed)
     private static readonly ConcurrentDictionary<int, TaskCompletionSource<double>> PendingSpot = new();
@@ -41,6 +45,12 @@ public sealed class TwsCallbacks : DefaultEWrapper
     private sealed class PendingDetailsReq
     {
         public required string Ticker;
+        public TaskCompletionSource Task = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private sealed class PendingUnderlyingReq
+    {
+        public List<UnderlyingDefinition> Rows = [];
         public TaskCompletionSource Task = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
@@ -99,46 +109,70 @@ public sealed class TwsCallbacks : DefaultEWrapper
     {
         if (PendingUnderlying.TryGetValue(reqId, out var u))
         {
-            u.TrySetResult(contractDetails.Contract.ConId);
+            var c = contractDetails.Contract;
+            lock (u.Rows) u.Rows.Add(new UnderlyingDefinition(c.ConId, c.SecType, c.Exchange ?? ""));
             return; // underlying resolution — not an option inventory entry
         }
         if (!PendingDetails.TryGetValue(reqId, out var p)) return;
-        var c = contractDetails.Contract;
+        var oc = contractDetails.Contract;
         var ticker = p.Ticker;
         var inv = Inventory.GetOrAdd(ticker, _ => new ConcurrentDictionary<long, ContractMeta>());
-        inv[c.ConId] = new ContractMeta(
-            ticker, c.ConId, c.Strike, c.Right, c.LastTradeDateOrContractMonth,
-            c.TradingClass ?? "", IndexPrimitives.SettlementOf(c.TradingClass ?? ""),
-            c.Exchange ?? "", double.TryParse(c.Multiplier, out var m) ? m : 100.0);
+        inv[oc.ConId] = new ContractMeta(
+            ticker, oc.ConId, oc.Strike, oc.Right, oc.LastTradeDateOrContractMonth,
+            oc.TradingClass ?? "", IndexPrimitives.SettlementOf(oc.TradingClass ?? ""),
+            oc.Exchange ?? "", double.TryParse(oc.Multiplier, out var m) ? m : 100.0);
     }
 
     public override void contractDetailsEnd(int reqId)
     {
         if (PendingUnderlying.TryRemove(reqId, out var u))
         {
-            u.TrySetResult(0); // no match — resolver reports failure
+            u.Task.TrySetResult(); // picker consumes the collected rows
             return;
         }
         if (PendingDetails.TryRemove(reqId, out var p))
             p.Task.TrySetResult();
     }
 
-    /// Resolve an UNDERLYING's conId via reqContractDetails on the index or
-    /// equity itself — reqSecDefOptParams references the underlying by conId.
-    internal static async Task<long> ResolveUnderlyingConIdAsync(EClientSocket client, MsgPacer pacer,
+    /// Resolve an UNDERLYING's definition via reqContractDetails —
+    /// reqSecDefOptParams references the underlying by conId. Indices are
+    /// queried UNPINNED (Symbol+SecType+Currency) so a pit TWS does not
+    /// define under the expected exchange still resolves (live 2026-09-09:
+    /// NDX-as-Symbol+IND+CBOE returned nothing → no chain, no spot, no book);
+    /// equities keep the SMART pin (many per-exchange rows otherwise). The
+    /// picker prefers the native pit, then SMART, then the first row. Returns
+    /// null on no rows / timeout — never throws into the caller's pipeline.
+    internal static async Task<UnderlyingDefinition?> ResolveUnderlyingAsync(EClientSocket client, MsgPacer pacer,
         string ticker, string secType, string exchange, Func<int> nextReqId, CancellationToken ct)
     {
+        var query = new IBApi.Contract
+        {
+            Symbol = ticker, SecType = secType, Currency = "USD",
+            Exchange = secType == "IND" ? "" : exchange,
+        };
         var reqId = nextReqId();
-        var tcs = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
-        PendingUnderlying[reqId] = tcs;
+        var pending = new PendingUnderlyingReq();
+        PendingUnderlying[reqId] = pending;
         try
         {
             await pacer.WaitAsync(ct);
-            client.reqContractDetails(reqId, new IBApi.Contract
+            client.reqContractDetails(reqId, query);
+            try { await pending.Task.Task.WaitAsync(TimeSpan.FromSeconds(15), ct); }
+            catch (TimeoutException)
             {
-                Symbol = ticker, SecType = secType, Exchange = exchange, Currency = "USD",
-            });
-            return await tcs.Task.WaitAsync(TimeSpan.FromSeconds(15), ct);
+                Console.Error.WriteLine($"tws: {ticker}: underlying definition timed out (secType {secType})");
+                return null;
+            }
+            lock (pending.Rows)
+            {
+                var pick = UnderlyingPicker.Pick(pending.Rows, exchange);
+                if (pick is null)
+                    Console.Error.WriteLine($"tws: {ticker}: no underlying definition (secType {secType}, {pending.Rows.Count} rows)");
+                else if (pending.Rows.Count > 1)
+                    Console.Error.WriteLine($"tws: {ticker}: underlying ambiguous ({pending.Rows.Count} rows: " +
+                                            $"{string.Join(",", pending.Rows.Select(r => $"{r.ConId}:{r.Exchange}"))}) — picked {pick.ConId}:{pick.Exchange}");
+                return pick;
+            }
         }
         finally { PendingUnderlying.TryRemove(reqId, out _); }
     }
@@ -164,6 +198,12 @@ public sealed class TwsCallbacks : DefaultEWrapper
     /// Resolve conIds for the core's subscription set: reqContractDetails per
     /// kept (class, expiry) — paced through the shared 50 msg/s budget. The
     /// returned metas are the streaming-subscription candidates.
+    ///
+    /// Per-pair resilience (live 2026-09-09: one hung pair threw through the
+    /// fire-and-forget subscribe task and silently killed that ticker's whole
+    /// rotation, leaving the book an empty skeleton): a timed-out pair logs
+    /// and is skipped; the caller proceeds with whatever resolved. Late rows
+    /// for a skipped pair are dropped (the request is removed from the map).
     internal static async Task<List<ContractMeta>> ResolveAsync(EClientSocket client, MsgPacer pacer,
         string ticker, HashSet<(string @class, string date)> keep, double lo, double hi, Func<int> nextReqId,
         CancellationToken ct)
@@ -173,27 +213,46 @@ public sealed class TwsCallbacks : DefaultEWrapper
         // resolved contract with the aggregator route and churn the core's
         // parameter audit (skeleton rows carry the native exchange)
         var route = IndexPrimitives.IsIndex(ticker) ? IndexPrimitives.For(ticker).exchange : "SMART";
+        ClearInventory(ticker); // stale metas from a previous discovery must not leak into this pass
+        var pairs = keep.Count;
+        var failedPairs = 0;
         foreach (var (cls, dates) in groups)
         {
             foreach (var date in dates)
             {
                 var reqId = nextReqId();
                 PendingDetails[reqId] = new PendingDetailsReq { Ticker = ticker };
-                await pacer.WaitAsync(ct);
-                client.reqContractDetails(reqId, new IBApi.Contract
+                try
                 {
-                    Symbol = ticker, SecType = "OPT", Exchange = route, TradingClass = cls,
-                    LastTradeDateOrContractMonth = date,
-                });
-                await PendingDetails[reqId].Task.Task.WaitAsync(TimeSpan.FromSeconds(30), ct);
+                    await pacer.WaitAsync(ct);
+                    client.reqContractDetails(reqId, new IBApi.Contract
+                    {
+                        Symbol = ticker, SecType = "OPT", Exchange = route, TradingClass = cls,
+                        LastTradeDateOrContractMonth = date,
+                    });
+                    await PendingDetails[reqId].Task.Task.WaitAsync(TimeSpan.FromSeconds(30), ct);
+                }
+                catch (TimeoutException)
+                {
+                    failedPairs++;
+                    Console.Error.WriteLine($"edge: {ticker}: conId resolve timed out for {cls} {date} — skipping pair");
+                }
+                finally { PendingDetails.TryRemove(reqId, out _); }
             }
         }
         if (!Inventory.TryGetValue(ticker, out var inv)) return [];
-        return inv.Values
+        var metas = inv.Values
             .Where(m => keep.Contains((m.TradingClass, m.Expiry)) && m.Strike >= lo && m.Strike <= hi)
             .OrderBy(m => m.Expiry).ThenBy(m => m.Strike)
             .ToList();
+        Console.Error.WriteLine($"edge: {ticker}: resolved {metas.Count} option contracts " +
+                                $"({pairs} pairs requested, {failedPairs} timed out)");
+        return metas;
     }
+
+    /// Drop a ticker's resolved-option inventory (called at each discovery —
+    /// metas are per-discovery state, the map must not accumulate across runs).
+    internal static void ClearInventory(string ticker) => Inventory.TryRemove(ticker, out _);
 
     // ── live market data ──
 
@@ -261,6 +320,30 @@ public sealed class TwsCallbacks : DefaultEWrapper
     {
         Console.Error.WriteLine("tws: connection closed");
         _feed.OnTwsConnectionClosed(Owner);
+    }
+}
+
+/// One resolved underlying definition: the conId plus the exchange TWS
+/// itself reported for it. Market-data lines subscribe by conId + secType
+/// (unambiguous — Symbol+Exchange routing errors 200 on indices this
+/// account does not define that way, e.g. NDX-as-Symbol+CBOE).
+public sealed record UnderlyingDefinition(long ConId, string SecType, string Exchange);
+
+/// Deterministic choice among the definitions TWS returned for one
+/// underlying: the native pit first (CBOE for this suite's indices), then
+/// the SMART aggregator, then the first row. Empty input → null.
+public static class UnderlyingPicker
+{
+    public static UnderlyingDefinition? Pick(IReadOnlyList<UnderlyingDefinition> rows, string nativeExchange)
+    {
+        if (rows.Count == 0) return null;
+        foreach (var r in rows)
+            if (string.Equals(r.Exchange, nativeExchange, StringComparison.OrdinalIgnoreCase))
+                return r;
+        foreach (var r in rows)
+            if (string.Equals(r.Exchange, "SMART", StringComparison.OrdinalIgnoreCase))
+                return r;
+        return rows[0];
     }
 }
 

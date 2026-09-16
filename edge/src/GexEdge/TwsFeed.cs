@@ -37,6 +37,11 @@ public sealed class TwsFeed : IDisposable
 
     private readonly ConcurrentDictionary<int, ContractMeta> _activeRequests = new(); // §3.7
     private readonly ConcurrentDictionary<int, string> _underlyingLines = new();
+    // tickers whose underlying L1 line is up for THIS run — the line needs the
+    // resolved conId (Symbol+Exchange routing errors 200 for indices like
+    // NDX), so discovery starts it; a discovery retry must not stack a second
+    // line for the same ticker
+    private readonly ConcurrentDictionary<string, byte> _l1Up = new();
     // reqId → last OPEN_INTEREST tick (generic tick 101); snapshots deliver
     // OI and model Greeks in separate callbacks — merged at enqueue time
     private readonly ConcurrentDictionary<int, double> _lastOI = new();
@@ -162,6 +167,7 @@ public sealed class TwsFeed : IDisposable
         try { _client?.eDisconnect(); } catch (Exception) { /* socket already gone */ }
         _activeRequests.Clear();
         _underlyingLines.Clear();
+        _l1Up.Clear();
         _lastOI.Clear();
         _lineHeld.Clear();
         _snapshotDone.Clear();
@@ -267,8 +273,7 @@ public sealed class TwsFeed : IDisposable
 
         foreach (var ticker in Tickers)
         {
-            _ = SubscribeUnderlyingAsync(ticker, feedCt); // spot lines (underlyings own the tickers)
-            _ = DiscoverChainAsync(ticker, feedCt);
+            _ = DiscoverChainAsync(ticker, feedCt); // starts the underlying L1 line once the conId resolves
         }
         try
         {
@@ -323,52 +328,107 @@ public sealed class TwsFeed : IDisposable
 
     /// Underlying L1 line: one market-data line per ticker (the
     /// reserved lines go to the 10 underlyings, not the option legs).
-    private async Task SubscribeUnderlyingAsync(string ticker, CancellationToken ct)
+    /// Subscribes by conId + secType + currency: Symbol+Exchange routing is
+    /// ambiguous/error-200 for indices on some accounts (NDX-as-Symbol+CBOE
+    /// never ticked live), while the conId the resolver picked is exactly
+    /// the definition TWS itself reported.
+    private async Task SubscribeUnderlyingAsync(string ticker, UnderlyingDefinition def, CancellationToken ct)
     {
         if (_client is not { } client || !client.IsConnected()) return;
-        if (!_lines.TryAcquire()) return;
+        if (!_l1Up.TryAdd(ticker, 0)) return; // one L1 line per ticker per run
+        if (!_lines.TryAcquire())
+        {
+            _l1Up.TryRemove(ticker, out _); // never subscribed — a retry may try again
+            return;
+        }
 
         var reqId = NextReqId();
         _underlyingLines[reqId] = ticker;
-        var (type, exchange) = IndexPrimitives.For(ticker);
         await _pacer.WaitAsync(ct);
-        // §3: index underlyings route NATIVE (SPX on CBOE) — SMART has no
-        // index definition and the request dies with error 200
-        _client.reqMktData(reqId, new IBApi.Contract
+        client.reqMktData(reqId, new IBApi.Contract
         {
-            Symbol = ticker, SecType = type,
-            Exchange = IndexPrimitives.IsIndex(ticker) ? exchange : "SMART",
-            Currency = "USD",
+            ConId = (int)def.ConId, SecType = def.SecType, Currency = "USD",
         }, "", false, false, new List<TagValue>());
     }
 
     /// Chain discovery (§3.6): reqSecDefOptParams → the full listing
     /// universe → chain event; the core's sub_set reply drives subscriptions.
+    ///
+    /// RETRIES with backoff: this task is fire-and-forget, so before this
+    /// loop any transient failure (unresolved underlying, sec-def timeout,
+    /// zero resolved contracts) permanently dropped the ticker for the whole
+    /// run with at most one stderr line — live 2026-09-09, NDX sent NOTHING
+    /// all day while SPX worked. A ticker only stays dark now if TWS keeps
+    /// refusing it, and every attempt says so on stderr.
     private async Task DiscoverChainAsync(string ticker, CancellationToken ct)
     {
-        while (_client is not { } client || !client.IsConnected())
-            await Task.Delay(TimeSpan.FromSeconds(2), ct);
-
-        var (underlyingType, exchange) = IndexPrimitives.For(ticker);
-
-        // reqSecDefOptParams references the underlying by conId — resolve it
-        // from the native listing first (0 is rejected with error 321)
-        var conId = await TwsCallbacks.ResolveUnderlyingConIdAsync(_client!, _pacer, ticker,
-            underlyingType, IndexPrimitives.IsIndex(ticker) ? exchange : "SMART", NextReqId, ct);
-        if (conId == 0)
+        // startup race: the ticker loops fire as the run starts — hold until
+        // the socket is actually live (the caller guarantees it connects or
+        // tears the run down)
+        while (_client is not { } client0 || !client0.IsConnected())
         {
-            Console.Error.WriteLine($"edge: {ticker}: no underlying conId found — skipping chain discovery");
-            return;
+            try { await Task.Delay(TimeSpan.FromSeconds(2), ct); }
+            catch (OperationCanceledException) { return; }
+            if (_paused == 1) return;
         }
 
-        // boot: selection MUST center on the live underlying — one
-        // snapshot quote (no continuous line) anchors the chain event. The
-        // resolved conId disambiguates the definition (NDX-as-Symbol+CBOE
-        // snapshots error 200) AND the native routing must stay — conId
-        // alone routes SMART, which has no index definition at all
-        var spot = await TwsCallbacks.AwaitBootSpotAsync(_client!, _pacer, new IBApi.Contract
+        var attempt = 0;
+        while (_client is { } client && client.IsConnected() && !ct.IsCancellationRequested)
         {
-            ConId = (int)conId,
+            var clientRef = client; // one attempt, one socket
+            try
+            {
+                if (await DiscoverChainOnceAsync(ticker, clientRef, ct))
+                    return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return; // run teardown (pause/cancel) — no retry
+            }
+            catch (OperationCanceledException) when (_paused == 1)
+            {
+                return; // paused mid-discovery — the fresh run re-discovers
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"edge: {ticker}: discovery failed: {ex.Message}");
+            }
+            attempt++;
+            var backoff = RetryBackoff.Delay(attempt);
+            Console.Error.WriteLine($"edge: {ticker}: discovery attempt {attempt} failed — retrying in {(int)backoff.TotalSeconds}s");
+            try { await Task.Delay(backoff, ct); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    /// One discovery pass. Returns true when the chain reached the core and
+    /// the subscription set resolved at least one contract (loops are live);
+    /// false = retry the whole pass.
+    private async Task<bool> DiscoverChainOnceAsync(string ticker, EClientSocket client, CancellationToken ct)
+    {
+        var (underlyingType, exchange) = IndexPrimitives.For(ticker);
+
+        // reqSecDefOptParams references the underlying by conId — resolve the
+        // definition first (unpinned for indices; 0 is rejected with error 321)
+        var def = await TwsCallbacks.ResolveUnderlyingAsync(client, _pacer, ticker,
+            underlyingType, exchange, NextReqId, ct);
+        if (def is null)
+        {
+            Console.Error.WriteLine($"edge: {ticker}: no underlying definition — retrying");
+            return false;
+        }
+
+        // the L1 spot line needs the same conId (one per run, started here so
+        // a failed discovery never strands a Symbol-routed line that errors)
+        await SubscribeUnderlyingAsync(ticker, def, ct);
+
+        // boot: selection MUST center on the live underlying — one snapshot
+        // quote (no continuous line) anchors the chain event. The resolved
+        // conId disambiguates the definition AND native routing must stay —
+        // conId alone routes SMART, which has no index definition at all
+        var spot = await TwsCallbacks.AwaitBootSpotAsync(client, _pacer, new IBApi.Contract
+        {
+            ConId = (int)def.ConId,
             SecType = underlyingType,
             Exchange = IndexPrimitives.IsIndex(ticker) ? exchange : "SMART",
             Currency = "USD",
@@ -384,20 +444,22 @@ public sealed class TwsFeed : IDisposable
         await _pacer.WaitAsync(ct);
         // the sec-type argument is the UNDERLYING's (IND/STK), not "OPT" —
         // passing OPT is rejected server-side with error 321
-        _client!.reqSecDefOptParams(paramsReqId, ticker, "", underlyingType, (int)conId);
+        client.reqSecDefOptParams(paramsReqId, ticker, "", underlyingType, (int)def.ConId);
         try { await paramsDone.WaitAsync(TimeSpan.FromSeconds(30), ct); }
         catch (TimeoutException)
         {
-            Console.Error.WriteLine($"edge: {ticker}: sec-def-opt-params timed out after 30s (conId {conId})");
-            return;
+            Console.Error.WriteLine($"edge: {ticker}: sec-def-opt-params timed out after 30s (conId {def.ConId})");
+            return false;
         }
 
         var (strikes, listings) = TwsCallbacks.TakeParams(paramsReqId);
         if (strikes.Count == 0 || listings.Count == 0)
         {
             Console.Error.WriteLine($"edge: {ticker}: empty sec-def-opt-params (permissions?)");
-            return;
+            return false;
         }
+        Console.Error.WriteLine($"edge: {ticker}: universe {listings.Count} listings, {strikes.Count} strikes " +
+                                $"(underlying {def.ConId}:{def.Exchange}, spot {spot})");
 
         var chain = new ChainEvent
         {
@@ -412,18 +474,29 @@ public sealed class TwsFeed : IDisposable
         };
 
         var sub = await _core.SendChainAsync(chain, ct);
-        await SubscribeSetAsync(ticker, sub, ct);
+        var subscribed = await SubscribeSetAsync(ticker, sub, ct);
+        if (!subscribed)
+        {
+            Console.Error.WriteLine($"edge: {ticker}: subscription set resolved no contracts — retrying discovery");
+            return false;
+        }
+        return true;
     }
 
     /// Apply the core's selection. EVERY ticker sweeps + rotates —
     /// index or equity: streaming N full chains cannot fit the 100-line
     /// budget, snapshots cost no continuous lines, and the shared gates
     /// keep the whole watchlist inside it exactly like a single SPX does.
-    private async Task SubscribeSetAsync(string ticker, SubSet sub, CancellationToken ct)
+    /// Returns false when NOTHING resolved (caller retries discovery);
+    /// a partial resolution is still true — the loops proceed with what
+    /// resolved and the retry-free cadence refreshes the rest.
+    private async Task<bool> SubscribeSetAsync(string ticker, SubSet sub, CancellationToken ct)
     {
         var keep = sub.Keep.Select(k => (k.TradingClass, k.Date)).ToHashSet();
         var wanted = await TwsCallbacks.ResolveAsync(_client!, _pacer, ticker, keep,
             sub.StrikeLo, sub.StrikeHi, NextReqId, ct);
+        if (wanted.Count == 0)
+            return false;
 
         // per-(class, expiry) windows: the 2SD width scales with DTE, so
         // bounding the sweep by the global envelope alone would request
@@ -452,6 +525,7 @@ public sealed class TwsFeed : IDisposable
         }
         if (OiLines > 0) // 0 disables: sweeps may carry OI themselves (106,101)
             _ = OIRotationLoopAsync(ticker, swept, ct);
+        return true;
     }
 
     /// Snapshot sweep: snapshots consume no CONTINUOUS
@@ -737,4 +811,12 @@ public static class IndexPrimitives
     public static bool IsIndex(string ticker) => Table.ContainsKey(ticker);
 
     public static string SettlementOf(string tradingClass) => SettlementTable.Of(tradingClass);
+}
+
+/// Discovery-retry backoff: 10s, 20s, 30s … capped at 60s. A long-running
+/// edge must keep retrying a dark ticker forever (TWS permissions can appear
+/// mid-session), but slowly enough not to storm the pacer.
+public static class RetryBackoff
+{
+    public static TimeSpan Delay(int attempt) => TimeSpan.FromSeconds(Math.Min(60, 10 * Math.Max(1, attempt)));
 }

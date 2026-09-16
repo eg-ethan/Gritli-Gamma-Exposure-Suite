@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"gexcore/internal/market"
+	"gexcore/internal/oiquote"
 )
 
 // fakeSink is the recording BookSink every ingest test runs against.
@@ -97,8 +98,22 @@ func (c *testClient) sendSeq(seq int64, typ string, data any) {
 	}
 }
 
-// readReply reads one core reply (fails the test on timeout).
+// readReply reads one core reply (fails the test on timeout). Unsolicited
+// push traffic (sweep_set follows every welcome — roster convergence, see
+// Server.handleConn) is skipped: the scripted tests speak request/reply.
 func (c *testClient) readReply() Envelope {
+	c.t.Helper()
+	for {
+		env := c.readOne()
+		if env.Type == TypeSweepSet {
+			continue
+		}
+		return env
+	}
+}
+
+// readOne reads exactly one reply line (any type).
+func (c *testClient) readOne() Envelope {
 	c.t.Helper()
 	done := make(chan Envelope, 1)
 	go func() {
@@ -146,13 +161,13 @@ func dial(t *testing.T, addr string) *testClient {
 }
 
 // smallUniverse is a compact mixed-class listing set: 2 SPXW dates + the
-// monthly under both classes, 5 strikes around spot.
+// monthly under both classes, 5 strikes around spot. Dates are guaranteed
+// distinct regardless of run day — when the upcoming Friday IS the monthly
+// (e.g. a Tuesday before a third Friday) the monthly bumps a month out, or
+// the class-count assertions collapse (observed live 2026-09-15).
 func smallUniverse() ChainEvent {
 	now := time.Now().UTC()
-	f1 := now.AddDate(0, 0, (5-int(now.Weekday())+7)%7) // this/next Friday
-	if f1.Sub(now) < 24*time.Hour {
-		f1 = f1.AddDate(0, 0, 7)
-	}
+	f1 := fridayAfter(now)
 	near := f1.AddDate(0, 0, -3) // a mid-week daily before F1
 	// keep it strictly future and distinct from f1: run on Wed/Thu, f1−3d
 	// lands in the past (selection drops it) or on f1's date (listings
@@ -160,10 +175,7 @@ func smallUniverse() ChainEvent {
 	for !near.After(now) || near.Format("20060102") == f1.Format("20060102") {
 		near = near.AddDate(0, 0, 1)
 	}
-	m := thirdFriday(now.Year(), now.Month())
-	if m.Before(now) {
-		m = thirdFriday(now.Year(), now.Month()+1)
-	}
+	m := monthlyAfter(now, f1)
 	return ChainEvent{
 		Ticker: "SPX", UnderlyingType: market.SecTypeIND, Exchange: "CBOE",
 		Spot: 6600, BaselineIV: 0.20, AsOfMs: now.UnixMilli(),
@@ -181,6 +193,26 @@ func thirdFriday(y int, m time.Month) time.Time {
 	first := time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
 	d := (5 - int(first.Weekday()) + 7) % 7
 	return first.AddDate(0, 0, d+14)
+}
+
+// fridayAfter returns the first Friday more than 24h out (this/next week).
+func fridayAfter(now time.Time) time.Time {
+	f := now.AddDate(0, 0, (5-int(now.Weekday())+7)%7)
+	for f.Sub(now) < 24*time.Hour {
+		f = f.AddDate(0, 0, 7)
+	}
+	return f
+}
+
+// monthlyAfter returns the nearest third-Friday monthly strictly future AND
+// distinct from avoid (when the upcoming Friday IS the monthly, bump a month
+// so weekly/monthly class-count assertions hold on any run day).
+func monthlyAfter(now, avoid time.Time) time.Time {
+	m := thirdFriday(now.Year(), now.Month())
+	if m.Before(now) || m.Format("20060102") == avoid.Format("20060102") {
+		m = thirdFriday(now.Year(), now.Month()+1)
+	}
+	return m
 }
 
 func optcompFor(c market.Contract, iv, bid, ask float64) OptComp {
@@ -293,6 +325,220 @@ func findCon(chain market.ChainSnapshot, conId int64) int {
 		}
 	}
 	return -1
+}
+
+// TestNDXLiveShapeEndToEnd regresses the 2026-09-09 live failure where NDX
+// never produced a book: the full ingest path for the real NDX listing shape
+// (NDX AM monthlies co-listed with NDXP PM weeklies/monthlies on CBOE) must
+// select, answer sub_set, resolve real conIds, and take vendor OI keyed by
+// the two class roots — the exact pipeline a working NDX run exercises.
+func TestNDXLiveShapeEndToEnd(t *testing.T) {
+	sink := newFakeSink()
+	srv, core := newTestServer(t, sink, nil)
+	cl := dial(t, srv.Addr().String())
+
+	cl.send(TypeHello, Hello{Instance: "ndx-test"})
+	if rep := cl.readReply(); rep.Type != TypeWelcome {
+		t.Fatalf("hello reply = %s, want welcome", rep.Type)
+	}
+
+	now := time.Now().UTC()
+	f1 := fridayAfter(now)
+	m := monthlyAfter(now, f1)
+	cl.send(TypeChain, ChainEvent{
+		Ticker: "NDX", UnderlyingType: market.SecTypeIND, Exchange: "CBOE",
+		Spot: 25200, BaselineIV: 0.18, AsOfMs: now.UnixMilli(),
+		Strikes: []float64{25100, 25150, 25200, 25250, 25300},
+		Listings: []ChainListing{
+			{Date: f1.Format("20060102"), TradingClass: "NDXP", Settlement: market.SettlementPM},
+			{Date: m.Format("20060102"), TradingClass: "NDXP", Settlement: market.SettlementPM},
+			{Date: m.Format("20060102"), TradingClass: "NDX", Settlement: market.SettlementAM},
+		},
+	})
+	rep := cl.readReply()
+	if rep.Type != TypeSubSet {
+		t.Fatalf("chain reply = %s, want sub_set", rep.Type)
+	}
+	var sub SubSet
+	if err := json.Unmarshal(rep.Data, &sub); err != nil {
+		t.Fatal(err)
+	}
+	ndx, ndxp := 0, 0
+	for _, l := range sub.Keep {
+		switch l.TradingClass {
+		case "NDX":
+			ndx++
+		case "NDXP":
+			ndxp++
+		}
+	}
+	// the AM monthly stays under NDX and the PM monthly+weekly under NDXP —
+	// class-segregated selection is what keeps the settlement books apart
+	if ndx != 1 || ndxp != 2 {
+		t.Fatalf("keep classes: NDX=%d NDXP=%d, want 1/2", ndx, ndxp)
+	}
+	core.FlushAll()
+	chain := sink.chain("NDX")
+	if len(chain.Contracts) == 0 {
+		t.Fatal("NDX skeleton never applied")
+	}
+
+	// one real-conId optcomp on an NDXP row resolves the placeholder id
+	var target market.Contract
+	for _, c := range chain.Contracts {
+		if c.TradingClass == "NDXP" {
+			target = c
+			break
+		}
+	}
+	if target.ConId == 0 {
+		t.Fatal("no NDXP row in skeleton")
+	}
+	oc := optcompFor(target, 0.22, 1, 1)
+	oc.ConId = 5151 // a realistic positive IBKR conId
+	cl.send(TypeOptComp, oc)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		core.FlushAll()
+		if i := findCon(sink.chain("NDX"), 5151); i >= 0 && sink.chain("NDX").Contracts[i].IV == 0.22 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if i := findCon(sink.chain("NDX"), 5151); i < 0 || sink.chain("NDX").Contracts[i].IV != 0.22 {
+		t.Fatal("NDXP optcomp never resolved into the book")
+	}
+
+	// vendor OI keyed by the two CBOE roots fills q=±OI for both classes
+	var entries []oiquote.Entry
+	for _, c := range sink.chain("NDX").Contracts {
+		entries = append(entries, oiquote.Entry{
+			Class: c.TradingClass, Expiry: c.ExpiryDate, Right: c.Right, Strike: c.Strike, OI: 321,
+		})
+	}
+	matched, contracts := core.ApplyVendorOI("NDX", entries)
+	if matched != contracts || contracts == 0 {
+		t.Fatalf("vendor OI matched %d of %d NDX contracts", matched, contracts)
+	}
+	core.FlushAll()
+	for _, c := range sink.chain("NDX").Contracts {
+		if c.OpenInterest != 321 {
+			t.Fatalf("NDX %.0f %s %s: OI = %v, want 321 (vendor)", c.Strike, c.Right, c.TradingClass, c.OpenInterest)
+		}
+	}
+}
+
+// TestEquityMultiClassLiveShapeEndToEnd regresses the equity half of the
+// 2026-09-09 failure: TWS lists equity options under extra trading classes
+// (TSLA + 2TSLA observed live), and the ingest must keep both classes'
+// selections, resolve optcomps carrying the non-default class, and leave
+// vendor-absent classes (2TSLA is not a CBOE root) at zero OI by design.
+func TestEquityMultiClassLiveShapeEndToEnd(t *testing.T) {
+	sink := newFakeSink()
+	srv, core := newTestServer(t, sink, nil)
+	cl := dial(t, srv.Addr().String())
+
+	cl.send(TypeHello, Hello{Instance: "eq-test"})
+	cl.readReply() // welcome
+
+	now := time.Now().UTC()
+	f1 := fridayAfter(now)
+	wed := f1.AddDate(0, 0, -2) // a Wednesday weekly under the 2TSLA class
+	for !wed.After(now) {
+		wed = wed.AddDate(0, 0, 7)
+	}
+	cl.send(TypeChain, ChainEvent{
+		Ticker: "TSLA", UnderlyingType: market.SecTypeSTK, Exchange: "",
+		Spot: 369, BaselineIV: 0.45, AsOfMs: now.UnixMilli(),
+		// strikes stay well inside 2SD even at DTE=1 (2sd ≈ 17), so the
+		// class-count assertions below hold on any run day
+		Strikes: []float64{363, 366, 369, 372, 375},
+		Listings: []ChainListing{
+			{Date: f1.Format("20060102"), TradingClass: "TSLA", Settlement: ""},
+			{Date: wed.Format("20060102"), TradingClass: "2TSLA", Settlement: ""},
+		},
+	})
+	rep := cl.readReply()
+	if rep.Type != TypeSubSet {
+		t.Fatalf("chain reply = %s, want sub_set", rep.Type)
+	}
+	var sub SubSet
+	if err := json.Unmarshal(rep.Data, &sub); err != nil {
+		t.Fatal(err)
+	}
+	classes := map[string]int{}
+	for _, l := range sub.Keep {
+		classes[l.TradingClass]++
+	}
+	if classes["TSLA"] != 1 || classes["2TSLA"] != 1 {
+		t.Fatalf("keep classes = %v, want TSLA=1 2TSLA=1", classes)
+	}
+	core.FlushAll()
+	chain := sink.chain("TSLA")
+	if len(chain.Contracts) == 0 {
+		t.Fatal("TSLA skeleton never applied")
+	}
+
+	// an optcomp carrying the non-default class must land on the 2TSLA row —
+	// findSkeletonRow matches the identity quadruple, class included
+	var second market.Contract
+	for _, c := range chain.Contracts {
+		if c.TradingClass == "2TSLA" {
+			second = c
+			break
+		}
+	}
+	if second.ConId == 0 {
+		t.Fatal("no 2TSLA row in skeleton")
+	}
+	oc := optcompFor(second, 0.55, 2, 2)
+	oc.ConId = 914646833 // a real live-observed equity option conId
+	cl.send(TypeOptComp, oc)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		core.FlushAll()
+		if i := findCon(sink.chain("TSLA"), 914646833); i >= 0 && sink.chain("TSLA").Contracts[i].IV == 0.55 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	got := sink.chain("TSLA")
+	i := findCon(got, 914646833)
+	if i < 0 || got.Contracts[i].IV != 0.55 || got.Contracts[i].TradingClass != "2TSLA" {
+		t.Fatalf("2TSLA optcomp never resolved: idx=%d", i)
+	}
+
+	// vendor OI for the TSLA root only: 2TSLA rows carry no vendor entry and
+	// must stay at their TWS-side value (0 here), never be zeroed by vendor
+	var entries []oiquote.Entry
+	vendorSeen := 0
+	for _, c := range got.Contracts {
+		if c.TradingClass != "TSLA" {
+			continue
+		}
+		entries = append(entries, oiquote.Entry{
+			Class: "TSLA", Expiry: c.ExpiryDate, Right: c.Right, Strike: c.Strike, OI: 777,
+		})
+		vendorSeen++
+	}
+	matched, _ := core.ApplyVendorOI("TSLA", entries)
+	if matched != vendorSeen {
+		t.Fatalf("vendor OI matched %d, want %d (TSLA class rows)", matched, vendorSeen)
+	}
+	core.FlushAll()
+	patched := sink.chain("TSLA")
+	for _, c := range patched.Contracts {
+		want := 0.0
+		switch {
+		case c.TradingClass == "TSLA":
+			want = 777 // vendor-refreshed
+		case c.ConId == 914646833:
+			want = 500 // TWS-delivered OI (the optcomp) wins where vendor has no entry
+		}
+		if c.OpenInterest != want {
+			t.Fatalf("%.0f %s %s (conId %d) OI = %v, want %v", c.Strike, c.Right, c.TradingClass, c.ConId, c.OpenInterest, want)
+		}
+	}
 }
 
 // TestSeqGapAndMalformed: a sequence hole and a garbage line each surface in

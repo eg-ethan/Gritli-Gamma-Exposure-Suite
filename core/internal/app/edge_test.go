@@ -83,6 +83,89 @@ func TestEdgeSinkRoutesChainAndComputes(t *testing.T) {
 	}
 }
 
+// TestEdgeBooksComputeNonZeroGEX is the GUI-level regression for the
+// 2026-09-09 live failure ("SPX works, NDX and US stocks don't"): an NDX
+// two-class chain and an equity chain in the exact live TWS shapes, once
+// patched with vendor OI, must both compute engine snapshots with non-zero
+// totals — the thing the dashboard renders.
+func TestEdgeBooksComputeNonZeroGEX(t *testing.T) {
+	now := func() time.Time { return time.Date(2026, 9, 14, 15, 0, 0, 0, time.UTC) }
+	s, err := New(Config{DBPath: "", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.UseExternalFeed()
+
+	type classSpec struct {
+		class   string
+		expiry  string
+		settle  string
+		strikes []float64
+	}
+	mk := func(ticker string, spot float64, classes []classSpec) market.ChainSnapshot {
+		var cons []market.Contract
+		id := int64(900000)
+		for _, cs := range classes {
+			for _, k := range cs.strikes {
+				for _, right := range []string{market.RightCall, market.RightPut} {
+					id++
+					cons = append(cons, market.Contract{
+						ConId: id, Ticker: ticker, Strike: k, Right: right,
+						ExpiryDate: cs.expiry, TradingClass: cs.class, Multiplier: 100,
+						OpenInterest: 500, IV: 0.25, Settlement: cs.settle,
+					})
+				}
+			}
+		}
+		return market.ChainSnapshot{Ticker: ticker, Spot: spot, AsOfMs: now().UnixMilli(), Contracts: cons}
+	}
+
+	// NDX: the real shape — AM monthly under NDX, PM weekly+monthly under NDXP
+	if err := s.ApplyChain(context.Background(), mk("NDX", 25200, []classSpec{
+		{"NDX", "20260918", market.SettlementAM, []float64{25100, 25200, 25300}},
+		{"NDXP", "20260916", market.SettlementPM, []float64{25150, 25200, 25250}},
+		{"NDXP", "20260918", market.SettlementPM, []float64{25100, 25200, 25300}},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// equity: TSLA + the live-observed 2TSLA secondary class
+	if err := s.ApplyChain(context.Background(), mk("TSLA", 369, []classSpec{
+		{"TSLA", "20260918", "", []float64{360, 365, 370}},
+		{"2TSLA", "20260916", "", []float64{365, 368}},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	s.RecomputeAll()
+
+	for _, ticker := range []string{"NDX", "TSLA"} {
+		st := s.State(ticker)
+		if st.Snapshot == nil {
+			t.Fatalf("%s: engine never computed a snapshot", ticker)
+		}
+		if st.Snapshot.Totals.GEX == 0 || st.Snapshot.Spot <= 0 {
+			t.Fatalf("%s: empty read model — totals %+v spot %v", ticker, st.Snapshot.Totals, st.Snapshot.Spot)
+		}
+		if len(st.Snapshot.PerStrike) == 0 {
+			t.Fatalf("%s: no per-strike rows", ticker)
+		}
+		wl := st.Watchlist
+		var entry *WatchEntry
+		for i := range wl {
+			if wl[i].Ticker == ticker {
+				entry = &wl[i]
+			}
+		}
+		if entry == nil || !entry.Ready {
+			t.Fatalf("%s: watchlist entry not ready: %+v", ticker, entry)
+		}
+	}
+	// NDX stays class-segregated in the read model (settlement economics)
+	if n := len(s.State("NDX").Snapshot.Classes); n != 2 {
+		t.Fatalf("NDX classes = %d, want 2 (NDX + NDXP)", n)
+	}
+}
+
 // TestFittedGARCHAnchorsEngine: with GARCH_Parameters persisted for a ticker,
 // the engine prices at the fitted model instead of the flat watchlist vol —
 // the fit job → live engine handoff.

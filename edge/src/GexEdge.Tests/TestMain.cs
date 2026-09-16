@@ -106,5 +106,42 @@ Check("optcomp roundtrips through the wire",
     back.Ticker == "TSLA" && back.ConId == 42 && back.Strike == 250 &&
     Math.Abs(back.Iv - 0.55) < 1e-9 && Math.Abs(back.OpenInterest - 1234) < 1e-9);
 
+// ── UnderlyingPicker: deterministic choice among TWS's rows ──
+// live 2026-09-09: NDX-as-Symbol+IND+CBOE resolved nothing → the ticker went
+// dark (no chain, no spot). Discovery now queries unpinned and picks here.
+Check("empty rows → null (failure, not a guess)",
+    UnderlyingPicker.Pick(Array.Empty<UnderlyingDefinition>(), "CBOE") is null);
+Check("single row wins outright",
+    UnderlyingPicker.Pick(new[] { new UnderlyingDefinition(111, "IND", "NASDAQ") }, "CBOE")!
+        .Equals(new UnderlyingDefinition(111, "IND", "NASDAQ")));
+Check("native pit preferred when present",
+    UnderlyingPicker.Pick(new[]
+    {
+        new UnderlyingDefinition(111, "IND", "NASDAQ"),
+        new UnderlyingDefinition(222, "IND", "CBOE"),
+    }, "CBOE")!.ConId == 222);
+Check("SMART beats a random pit when native absent",
+    UnderlyingPicker.Pick(new[]
+    {
+        new UnderlyingDefinition(111, "STK", "NASDAQ"),
+        new UnderlyingDefinition(222, "STK", "SMART"),
+    }, "CBOE")!.ConId == 222);
+Check("first row survives when neither native nor SMART matched",
+    UnderlyingPicker.Pick(new[]
+    {
+        new UnderlyingDefinition(111, "IND", "AMEX"),
+        new UnderlyingDefinition(222, "IND", "PHLX"),
+    }, "CBOE")!.ConId == 111);
+Check("pit match is case-insensitive (TWS casing varies)",
+    UnderlyingPicker.Pick(new[] { new UnderlyingDefinition(9, "IND", "cboe") }, "CBOE")!.ConId == 9);
+
+// ── RetryBackoff: a dark ticker keeps retrying, slowly ──
+Check("first retry waits 10s", RetryBackoff.Delay(1) == TimeSpan.FromSeconds(10));
+Check("backoff grows linearly", RetryBackoff.Delay(2) == TimeSpan.FromSeconds(20) &&
+    RetryBackoff.Delay(6) == TimeSpan.FromSeconds(60));
+Check("backoff caps at 60s", RetryBackoff.Delay(600) == TimeSpan.FromSeconds(60));
+Check("zero/negative attempt clamped to the first step",
+    RetryBackoff.Delay(0) == TimeSpan.FromSeconds(10) && RetryBackoff.Delay(-3) == TimeSpan.FromSeconds(10));
+
 Console.Out.WriteLine(failures == 0 ? "\nall green" : $"\n{failures} FAILURE(S)");
 return failures;
