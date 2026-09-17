@@ -21,6 +21,11 @@ __pycache__/
 .obsidian/
 .zcode/
 
+# local ops config — holds machine-specific paths to the db and closes CSVs;
+# commit fit-tickers.example.json instead
+ops/fit-tickers.json
+ops/logs/
+
 # third-party copyrighted material
 .firecrawl/
 ssrn-PDTS.pdf

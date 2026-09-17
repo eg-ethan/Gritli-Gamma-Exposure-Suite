@@ -4,17 +4,19 @@
 # Params + warm-start State into GARCH_Parameters / GARCH_State, from where
 # the app's engines anchor their term structures (app.engineFor).
 #
-# Ticker→CSV mapping lives in fit-tickers.json next to this script:
-#   { "db": "E:/gexProject/core/gex.db",
-#     "tickers": { "SPX": "E:/gexdata/SPX_closes.csv", ... } }
+# Ticker→CSV mapping lives in fit-tickers.json next to this script; copy
+# fit-tickers.example.json to fit-tickers.json and edit the paths:
+#   { "db": "../core/gex.db",
+#     "tickers": { "SPX": "C:/path/to/closes/SPX_closes.csv", ... } }
 # CSV format (any vendor export): one close per line, "date,close" or bare
 # "close"; a header row is tolerated (gexctl fit-garch --returns).
 #
 # Register once (run as the user who owns gex.db):
 #   schtasks /Create /TN "GEX nightly GARCH fit" /SC DAILY /ST 18:30 ^
-#     /TR "powershell -NoProfile -ExecutionPolicy Bypass -File E:\gexProject\ops\nightly-fit.ps1"
+#     /TR "powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\ops\nightly-fit.ps1"
 #
-# gexctl resolution order: $env:GEXCTL, .\core\gexctl.exe, E:\gexProject\core\gexctl.exe.
+# gexctl resolution order: $env:GEXCTL, then ..\core\gexctl.exe and
+# ..\core\dist\gexctl.exe relative to this script.
 
 $ErrorActionPreference = "Continue"
 
@@ -24,7 +26,7 @@ $logDir   = Join-Path $here "logs"
 $stamp    = Get-Date -Format "yyyyMMdd-HHmmss"
 
 if (-not (Test-Path $config)) {
-    Write-Error "missing config: $config (copy the shape from the header comment)"
+    Write-Error "missing config: $config (copy fit-tickers.example.json to fit-tickers.json and edit the paths)"
     exit 1
 }
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
@@ -32,7 +34,7 @@ $log = Join-Path $logDir "fit-$stamp.log"
 
 $gexctl = $env:GEXCTL
 if (-not $gexctl) {
-    foreach ($c in @((Join-Path $here "..\core\gexctl.exe"), "E:\gexProject\core\gexctl.exe")) {
+    foreach ($c in @("..\core\gexctl.exe", "..\core\dist\gexctl.exe")) {
         $resolved = [System.IO.Path]::GetFullPath((Join-Path $here $c))
         if (Test-Path $resolved) { $gexctl = $resolved; break }
     }

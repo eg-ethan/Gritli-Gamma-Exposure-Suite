@@ -1,7 +1,0 @@
-{
-  "db": "E:/gexProject/core/gex.db",
-  "tickers": {
-    "SPX": "E:/gexdata/SPX_closes.csv",
-    "SPY": "E:/gexdata/SPY_closes.csv"
-  }
-}

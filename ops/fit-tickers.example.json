@@ -1,0 +1,7 @@
+{
+  "db": "../core/gex.db",
+  "tickers": {
+    "SPX": "C:/path/to/closes/SPX_closes.csv",
+    "SPY": "C:/path/to/closes/SPY_closes.csv"
+  }
+}
