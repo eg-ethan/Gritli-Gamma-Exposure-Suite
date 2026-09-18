@@ -328,10 +328,13 @@ public sealed class TwsFeed : IDisposable
 
     /// Underlying L1 line: one market-data line per ticker (the
     /// reserved lines go to the 10 underlyings, not the option legs).
-    /// Subscribes by conId + secType + currency: Symbol+Exchange routing is
-    /// ambiguous/error-200 for indices on some accounts (NDX-as-Symbol+CBOE
-    /// never ticked live), while the conId the resolver picked is exactly
-    /// the definition TWS itself reported.
+    /// Subscribes by conId + secType + THE RESOLVED DEFINITION'S EXCHANGE:
+    /// conId alone is rejected by TWS for streaming (321 "Please enter
+    /// exchange", probed live 2026-09-17), and the definition's exchange —
+    /// not a hardcoded pit — is where TWS actually lists the quote (NDX's
+    /// index is NASDAQ, not CBOE). A ticker whose index quote is not
+    /// entitled (NDX NASDAQ, error 354) logs once per run; its spot then
+    /// rides option undPrice + vendor quotes.
     private async Task SubscribeUnderlyingAsync(string ticker, UnderlyingDefinition def, CancellationToken ct)
     {
         if (_client is not { } client || !client.IsConnected()) return;
@@ -347,7 +350,9 @@ public sealed class TwsFeed : IDisposable
         await _pacer.WaitAsync(ct);
         client.reqMktData(reqId, new IBApi.Contract
         {
-            ConId = (int)def.ConId, SecType = def.SecType, Currency = "USD",
+            ConId = (int)def.ConId, SecType = def.SecType,
+            Exchange = string.IsNullOrWhiteSpace(def.Exchange) ? "SMART" : def.Exchange,
+            Currency = "USD",
         }, "", false, false, new List<TagValue>());
     }
 
@@ -423,14 +428,15 @@ public sealed class TwsFeed : IDisposable
         await SubscribeUnderlyingAsync(ticker, def, ct);
 
         // boot: selection MUST center on the live underlying — one snapshot
-        // quote (no continuous line) anchors the chain event. The resolved
-        // conId disambiguates the definition AND native routing must stay —
-        // conId alone routes SMART, which has no index definition at all
+        // quote (no continuous line) anchors the chain event. Routed by the
+        // RESOLVED definition's exchange: a hardcoded pit 200s for indices
+        // TWS lists elsewhere (NDX's only definition is NASDAQ; conId+CBOE
+        // is no definition at all, probed live 2026-09-17)
         var spot = await TwsCallbacks.AwaitBootSpotAsync(client, _pacer, new IBApi.Contract
         {
             ConId = (int)def.ConId,
             SecType = underlyingType,
-            Exchange = IndexPrimitives.IsIndex(ticker) ? exchange : "SMART",
+            Exchange = string.IsNullOrWhiteSpace(def.Exchange) ? "SMART" : def.Exchange,
             Currency = "USD",
         }, NextReqId, ct);
         if (spot <= 0)
