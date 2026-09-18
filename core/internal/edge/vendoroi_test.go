@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -119,7 +120,7 @@ func TestRunVendorOIRefreshesNewTickers(t *testing.T) {
 		t.Fatal("chain did not adopt")
 	}
 
-	fetches := 0
+	var fetches atomic.Int32
 	srv := newVendorTestServer(t, chain, &fetches)
 	defer srv.Close()
 
@@ -131,10 +132,10 @@ func TestRunVendorOIRefreshesNewTickers(t *testing.T) {
 	defer cancel()
 
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && fetches == 0 {
+	for time.Now().Before(deadline) && fetches.Load() == 0 {
 		time.Sleep(50 * time.Millisecond)
 	}
-	if fetches == 0 {
+	if fetches.Load() == 0 {
 		t.Fatal("vendor loop never fetched the active ticker")
 	}
 	patched := sink.chain("SPX")
@@ -177,10 +178,10 @@ func shiftOrFatal(t *testing.T, ymd string, days int) string {
 // newVendorTestServer serves a CBOE-shaped delayed-quotes document whose
 // options are exactly the adopted chain's contracts (OCC symbols rebuilt
 // from class/expiry/right/strike) with OI 4242 — a full-match refresh.
-func newVendorTestServer(t *testing.T, chain market.ChainSnapshot, fetches *int) *httptest.Server {
+func newVendorTestServer(t *testing.T, chain market.ChainSnapshot, fetches *atomic.Int32) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		*fetches++
+		fetches.Add(1)
 		opts := make([]map[string]any, 0, len(chain.Contracts))
 		for _, c := range chain.Contracts {
 			sym := c.TradingClass + c.ExpiryDate[2:] + c.Right + fmt.Sprintf("%08d", int64(c.Strike*1000))

@@ -131,7 +131,7 @@ func (e *Engine) RecomputeLevels() {
 		LiveBlend: e.cfg.BlendIVs,
 	})
 	if err != nil {
-		e.logFn("exposure: levels recompute failed: %v", err)
+		e.logFn("exposure: %s: levels recompute failed: %v", e.cfg.Ticker, err)
 		return
 	}
 	if prev := e.snap.Load(); prev != nil {
@@ -161,7 +161,7 @@ func (e *Engine) RecomputeFlip() {
 	// Levels first so FindFlip has current totals; then overlay the flip.
 	snap, err := ComputeSnapshot(in)
 	if err != nil {
-		e.logFn("exposure: flip recompute failed: %v", err)
+		e.logFn("exposure: %s: flip recompute failed: %v", e.cfg.Ticker, err)
 		return
 	}
 	e.snap.Store(&snap)

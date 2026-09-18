@@ -67,6 +67,7 @@ func (c *Core) ApplyVendorOI(ticker string, entries []oiquote.Entry) (matched, c
 	}
 	if matched > 0 {
 		ti.pending = true
+		c.flushTickerLocked(ticker) // publish the patched chain now — the book holds frozen copies, not the live array
 	}
 	c.diag.vendorOI(ticker, matched, len(ti.chain.Contracts), len(entries) > 0)
 	return matched, len(ti.chain.Contracts)

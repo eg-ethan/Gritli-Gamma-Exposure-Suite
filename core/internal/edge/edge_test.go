@@ -62,6 +62,21 @@ func (f *fakeSink) chain(ticker string) market.ChainSnapshot {
 	return f.chains[ticker]
 }
 
+// spot / hasSpot are the locked reads — tests poll them while the server
+// goroutine writes.
+func (f *fakeSink) spot(ticker string) float64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.spots[ticker]
+}
+
+func (f *fakeSink) hasSpot(ticker string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.spots[ticker]
+	return ok
+}
+
 // testClient is a scripted edge client over a real loopback connection.
 type testClient struct {
 	t    *testing.T
@@ -305,11 +320,11 @@ func TestHandshakeSelectionAndPatch(t *testing.T) {
 
 	cl.send(TypeSpot, SpotEvent{Ticker: "SPX", Price: 6610.25})
 	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && sink.spots["SPX"] != 6610.25 {
+	for time.Now().Before(deadline) && sink.spot("SPX") != 6610.25 {
 		time.Sleep(2 * time.Millisecond)
 	}
-	if sink.spots["SPX"] != 6610.25 {
-		t.Fatalf("spot not applied: %v", sink.spots["SPX"])
+	if sink.spot("SPX") != 6610.25 {
+		t.Fatalf("spot not applied: %v", sink.spot("SPX"))
 	}
 
 	d := core.Diagnostics().Read()
@@ -759,7 +774,7 @@ func TestJournalRecordAndReplay(t *testing.T) {
 	}
 
 	live := newFakeSink()
-	srv, _ := newTestServer(t, live, jr)
+	srv, core := newTestServer(t, live, jr)
 	cl := dial(t, srv.Addr().String())
 	cl.send(TypeHello, Hello{Instance: "recorded"})
 	cl.readReply()
@@ -774,7 +789,8 @@ func TestJournalRecordAndReplay(t *testing.T) {
 		cl.send(TypeOptComp, oc)
 	}
 	cl.send(TypeSpot, SpotEvent{Ticker: "SPX", Price: 6650.5})
-	time.Sleep(100 * time.Millisecond) // let the live flush cycle land
+	time.Sleep(100 * time.Millisecond) // let the server goroutine absorb the batch
+	core.FlushAll()                    // publish the patched chain (the sink now holds frozen copies)
 	if err := jr.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -801,7 +817,7 @@ func TestJournalRecordAndReplay(t *testing.T) {
 	// replay into a fresh core + sink through the SAME Dispatch path
 	replaySink := newFakeSink()
 	var replayClock time.Time = time.Now()
-	core := NewCore(replaySink, nil, Config{Now: func() time.Time { return replayClock }}, nil)
+	replayCore := NewCore(replaySink, nil, Config{Now: func() time.Time { return replayClock }}, nil)
 	sess := &Session{ID: "replay"}
 	for _, e := range entries {
 		if e.Dir != "in" {
@@ -812,9 +828,9 @@ func TestJournalRecordAndReplay(t *testing.T) {
 			t.Fatalf("journal line undecodable: %v", err)
 		}
 		replayClock = time.UnixMilli(e.RecvMs)
-		core.Dispatch(sess, env)
+		replayCore.Dispatch(sess, env)
 	}
-	core.FlushAll()
+	replayCore.FlushAll()
 
 	liveChain := live.chain("SPX")
 	replayChain := replaySink.chain("SPX")
@@ -826,15 +842,16 @@ func TestJournalRecordAndReplay(t *testing.T) {
 	}
 	for i := range liveChain.Contracts {
 		l, r := liveChain.Contracts[i], replayChain.Contracts[i]
-		// placeholder conIds are regenerated identically (deterministic order)
-		if l.Strike != r.Strike || l.Right != r.Right || l.ExpiryDate != r.ExpiryDate ||
+		// placeholder conIds are regenerated identically (the stamping
+		// counter is a pure function of the event sequence)
+		if l.ConId != r.ConId || l.Strike != r.Strike || l.Right != r.Right || l.ExpiryDate != r.ExpiryDate ||
 			l.TradingClass != r.TradingClass || l.IV != r.IV || l.OpenInterest != r.OpenInterest ||
 			l.Multiplier != r.Multiplier {
 			t.Fatalf("replay diverged at contract %d: live %+v replay %+v", i, l, r)
 		}
 	}
-	if replaySink.spots["SPX"] != live.spots["SPX"] {
-		t.Fatalf("replay spot %v != live %v", replaySink.spots["SPX"], live.spots["SPX"])
+	if replaySink.spot("SPX") != live.spot("SPX") {
+		t.Fatalf("replay spot %v != live %v", replaySink.spot("SPX"), live.spot("SPX"))
 	}
 }
 
@@ -879,7 +896,7 @@ func TestSimulatorEndToEnd(t *testing.T) {
 	if oiSeen == 0 {
 		t.Fatal("no OI ever arrived through optcomp events")
 	}
-	if sink.spots["SPX"] == 0 {
+	if sink.spot("SPX") == 0 {
 		t.Fatal("no spot ticks applied")
 	}
 
@@ -952,9 +969,7 @@ func TestFeedsGateFreeze(t *testing.T) {
 		t.Fatalf("events counted while frozen: %d → %d", before, after)
 	}
 
-	sink.mu.Lock()
-	_, gotSpot := sink.spots["SPX"]
-	sink.mu.Unlock()
+	gotSpot := sink.hasSpot("SPX")
 	if gotSpot {
 		t.Fatal("spot applied while feeds were frozen")
 	}
@@ -969,9 +984,7 @@ func TestFeedsGateFreeze(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		sink.mu.Lock()
-		v := sink.spots["SPX"]
-		sink.mu.Unlock()
+		v := sink.spot("SPX")
 		if v == 6601 {
 			break
 		}
@@ -1006,10 +1019,125 @@ func TestFrozenConnectGetsPaused(t *testing.T) {
 
 	// and a data event still neither applies nor replies
 	c.send(TypeSpot, SpotEvent{Ticker: "SPX", Price: 6600})
-	sink.mu.Lock()
-	_, gotSpot := sink.spots["SPX"]
-	sink.mu.Unlock()
+	gotSpot := sink.hasSpot("SPX")
 	if gotSpot {
 		t.Fatal("spot applied while feeds were frozen")
 	}
+}
+
+// bigUniverse models the live SPX discovery shape that broke boot restore on
+// 2026-09-18: ~60 weekday listings × a full strike ladder ≈ 90k skeleton rows
+// — far past any per-ticker namespace slot — while selection keeps only the
+// 3-4 near-dated listings plus the deep monthly.
+func bigUniverse() ChainEvent {
+	now := time.Now().UTC()
+	strikes := make([]float64, 0, 800)
+	for k := 4000.0; k <= 14000; k += 25 {
+		strikes = append(strikes, k)
+	}
+	var listings []ChainListing
+	d := now.AddDate(0, 0, 1)
+	for len(listings) < 56 {
+		if d.Weekday() != time.Saturday && d.Weekday() != time.Sunday {
+			listings = append(listings, ChainListing{Date: d.Format("20060102"), TradingClass: "SPXW", Settlement: market.SettlementPM})
+		}
+		d = d.AddDate(0, 0, 1)
+	}
+	f := fridayAfter(now)
+	m := monthlyAfter(now, f)
+	listings = append(listings,
+		ChainListing{Date: m.Format("20060102"), TradingClass: "SPXW", Settlement: market.SettlementPM},
+		ChainListing{Date: m.Format("20060102"), TradingClass: "SPX", Settlement: market.SettlementAM},
+	)
+	return ChainEvent{
+		Ticker: "SPX", UnderlyingType: market.SecTypeIND, Exchange: "CBOE",
+		Spot: 6600, BaselineIV: 0.20, AsOfMs: now.UnixMilli(),
+		Strikes: strikes, Listings: listings,
+	}
+}
+
+// TestBigUniverseConIdsStayInNamespace is the 2026-09-18 regression: the
+// skeleton once numbered the ENTIRE discovered universe, so the selected
+// monthly's placeholder ids landed in foreign namespace slots and boot
+// restore dropped them (SPX/NDX came back with 0DTE-only books). Ids are now
+// stamped only over the selected chain and must be in-slot and unique — and
+// stable across a re-discovery of the same universe.
+func TestBigUniverseConIdsStayInNamespace(t *testing.T) {
+	sink := newFakeSink()
+	srv, core := newTestServer(t, sink, nil)
+	cl := dial(t, srv.Addr().String())
+	cl.send(TypeHello, Hello{Instance: "big-universe"})
+	cl.readReply()
+
+	ev := bigUniverse()
+	cl.send(TypeChain, ev)
+	if rep := cl.readReply(); rep.Type != TypeSubSet {
+		t.Fatalf("chain reply = %s, want sub_set", rep.Type)
+	}
+
+	idsOf := func(chain market.ChainSnapshot) map[market.Contract]struct{} {
+		seen := map[int64]struct{}{}
+		byIdentity := map[market.Contract]struct{}{}
+		for _, c := range chain.Contracts {
+			if c.ConId >= 0 {
+				t.Fatalf("unresolved row carries a non-placeholder id %d (%.0f %s %s)", c.ConId, c.Strike, c.Right, c.ExpiryDate)
+			}
+			if !market.ConIdMatchesTicker(c.ConId, "SPX") {
+				t.Fatalf("conId %d outside the SPX namespace (%.0f %s %s %s)", c.ConId, c.Strike, c.Right, c.ExpiryDate, c.TradingClass)
+			}
+			if _, dup := seen[c.ConId]; dup {
+				t.Fatalf("duplicate placeholder conId %d", c.ConId)
+			}
+			seen[c.ConId] = struct{}{}
+			id := c
+			id.ConId = 0
+			byIdentity[id] = struct{}{}
+		}
+		return byIdentity
+	}
+
+	chain := sink.chain("SPX")
+	if len(chain.Contracts) == 0 {
+		t.Fatal("chain not applied")
+	}
+	first := idsOf(chain)
+	// the deep monthly must be part of the selection (both classes)
+	spx := 0
+	for _, c := range chain.Contracts {
+		if c.TradingClass == "SPX" {
+			spx++
+		}
+	}
+	if spx == 0 {
+		t.Fatal("monthly (SPX class) missing from the applied chain")
+	}
+
+	// re-discovery of the identical universe: every identity carries its id
+	cl.send(TypeChain, ev)
+	cl.readReply()
+	core.FlushAll()
+	second := idsOf(sink.chain("SPX"))
+	if len(second) != len(first) {
+		t.Fatalf("re-discovery changed the chain: %d → %d identities", len(first), len(second))
+	}
+	for id := range first {
+		if _, ok := second[id]; !ok {
+			t.Fatalf("re-discovery lost identity %+v", id)
+		}
+	}
+
+	// and an optcomp still resolves a placeholder by identity to a real id
+	target := sink.chain("SPX").Contracts[0]
+	oc := optcompFor(target, 0.21, 1.9, 2.1)
+	oc.ConId = 990001
+	cl.send(TypeOptComp, oc)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		core.FlushAll()
+		if findCon(sink.chain("SPX"), 990001) >= 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("optcomp never resolved to a book row")
 }

@@ -270,9 +270,14 @@ func HashSeed(s string) uint64 {
 	return h
 }
 
-// conIdSlotWidth is the conId namespace width per ticker (wide enough for any
-// generated chain; ~2k contracts max vs 5000 slots).
-const conIdSlotWidth = 5000
+// ConIdSlotWidth is the conId namespace width per ticker. It must cover the
+// densest legitimate allocation: the generators top out near ~3k contracts,
+// and the edge ingest stamps placeholder ids only over the SELECTED chain
+// (a few thousand rows) from a per-session counter that grows by roughly a
+// chain-width per re-discovery — 200k gives over a year of headroom there.
+// Ids beyond the slot fall into a neighboring ticker's namespace and are
+// dropped at boot restore, so any allocator change must respect this bound.
+const ConIdSlotWidth = 200_000
 
 // syntheticNamespace is the per-ticker slot index the negative synthetic conId
 // ranges live in (hash % 1e6), shared by the generator, the CSV loader, and
@@ -284,7 +289,7 @@ const syntheticNamespace = 1_000_000
 // collide with real IBKR Con_Ids, and the per-ticker base keeps multi-ticker
 // persistence off the Option_Contracts primary key.
 func SyntheticConIDBase(ticker string) int64 {
-	return -int64(HashSeed(ticker)%syntheticNamespace) * conIdSlotWidth
+	return -int64(HashSeed(ticker)%syntheticNamespace) * ConIdSlotWidth
 }
 
 // ConIdMatchesTicker reports whether a negative synthetic conId belongs to the
@@ -295,5 +300,5 @@ func ConIdMatchesTicker(conId int64, ticker string) bool {
 	if conId >= 0 {
 		return true
 	}
-	return uint64((-conId-1)/conIdSlotWidth) == HashSeed(ticker)%syntheticNamespace
+	return uint64((-conId-1)/ConIdSlotWidth) == HashSeed(ticker)%syntheticNamespace
 }

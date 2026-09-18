@@ -2,11 +2,16 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"gexcore/internal/market"
+	"gexcore/internal/store"
 )
 
 func testConfig(db string) Config {
@@ -428,5 +433,122 @@ func TestExternalFeedGate(t *testing.T) {
 	must(true)
 	if !last || calls != n+2 {
 		t.Fatalf("reconnect must resume the feed (last=%v calls=%d)", last, calls)
+	}
+}
+
+// TestBootStaleChainIdlesSilently: a saved chain with nothing beyond same-day
+// expiry (the 2026-09-18 live shape — monthly-expiry Friday after a restart)
+// must restore the ticker NOT-READY with an empty book: no synthetic seeding,
+// no per-second recompute failure spam — and it must recover the moment a
+// fresh chain arrives from the edge.
+func TestBootStaleChainIdlesSilently(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "gex.db")
+	now := time.Now().UTC()
+	today := now.Format("20060102")
+	tomorrow := now.AddDate(0, 0, 1).Format("20060102")
+
+	str, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := market.SyntheticConIDBase("SPY")
+	if err := str.UpsertUnderlying("SPY", 660, 0.2); err != nil {
+		t.Fatal(err)
+	}
+	if err := str.UpsertContracts([]market.Contract{
+		{ConId: base - 1, Ticker: "SPY", Strike: 650, Right: market.RightCall, ExpiryDate: today, TradingClass: "SPY", Multiplier: 100, OpenInterest: 10},
+		{ConId: base - 2, Ticker: "SPY", Strike: 650, Right: market.RightPut, ExpiryDate: today, TradingClass: "SPY", Multiplier: 100, OpenInterest: 10},
+		{ConId: base - 3, Ticker: "SPY", Strike: 640, Right: market.RightCall, ExpiryDate: "20260101", TradingClass: "SPY", Multiplier: 100, OpenInterest: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	str.FlushAndWait()
+	if err := str.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var logBuf strings.Builder
+	cfg := testConfig(db)
+	cfg.Logger = func(f string, a ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		fmt.Fprintf(&logBuf, f, a...)
+		logBuf.WriteByte('\n')
+	}
+	svc, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.Run(ctx)
+
+	time.Sleep(750 * time.Millisecond) // several engine cadences
+	if svc.State("SPY").Ready {
+		t.Fatal("stale (0DTE-only) saved chain must restore not-ready")
+	}
+	mu.Lock()
+	logs := logBuf.String()
+	mu.Unlock()
+	if !strings.Contains(logs, "saved chain has no contracts with DTE >= 1") {
+		t.Fatalf("missing the stale-restore log line:\n%s", logs)
+	}
+	if strings.Contains(logs, "recompute failed") {
+		t.Fatalf("stale restore must not spam recompute failures:\n%s", logs)
+	}
+
+	// recovery: a fresh chain with a future expiry makes the engine compute
+	if err := svc.ApplyChain(ctx, market.ChainSnapshot{Ticker: "SPY", Spot: 660, AsOfMs: time.Now().UnixMilli(), Contracts: []market.Contract{
+		{ConId: 486153, Ticker: "SPY", Strike: 650, Right: market.RightCall, ExpiryDate: tomorrow, TradingClass: "SPY", Multiplier: 100, OpenInterest: 10},
+		{ConId: 486154, Ticker: "SPY", Strike: 650, Right: market.RightPut, ExpiryDate: tomorrow, TradingClass: "SPY", Multiplier: 100, OpenInterest: 10},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return svc.State("SPY").Ready })
+	if svc.State("SPY").Snapshot == nil {
+		t.Fatal("engine never computed after the fresh chain landed")
+	}
+}
+
+// TestBootRestoreDropsExpiredRows: expired rows from older sessions never
+// re-enter a tradable restored book — boot restores a trading book, not an
+// archive.
+func TestBootRestoreDropsExpiredRows(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "gex.db")
+	tomorrow := time.Now().UTC().AddDate(0, 0, 1).Format("20060102")
+
+	str, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := market.SyntheticConIDBase("SPY")
+	if err := str.UpsertUnderlying("SPY", 660, 0.2); err != nil {
+		t.Fatal(err)
+	}
+	if err := str.UpsertContracts([]market.Contract{
+		{ConId: base - 1, Ticker: "SPY", Strike: 650, Right: market.RightCall, ExpiryDate: tomorrow, TradingClass: "SPY", Multiplier: 100, OpenInterest: 10},
+		{ConId: base - 2, Ticker: "SPY", Strike: 650, Right: market.RightPut, ExpiryDate: tomorrow, TradingClass: "SPY", Multiplier: 100, OpenInterest: 10},
+		{ConId: base - 3, Ticker: "SPY", Strike: 640, Right: market.RightCall, ExpiryDate: "20260101", TradingClass: "SPY", Multiplier: 100, OpenInterest: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	str.FlushAndWait()
+	if err := str.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	svc, err := New(testConfig(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.Run(ctx)
+	waitFor(t, 5*time.Second, func() bool { return svc.State("SPY").Ready })
+	if n := svc.State("SPY").Contracts; n != 2 {
+		t.Fatalf("restored book holds %d contracts, want the 2 future rows only", n)
 	}
 }

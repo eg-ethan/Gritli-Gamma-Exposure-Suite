@@ -215,6 +215,17 @@ func (s *Service) restoreBootState(entries *[]TickerConfig, customSet *bool) err
 			s.cfg.Logger("app: boot %s: dropped %d contracts with foreign synthetic ids",
 				chain.Ticker, len(chain.Contracts)-len(kept))
 		}
+		// expired rows (saved by an older session) never re-enter the model —
+		// boot restores a trading book, not an archive
+		now := s.cfg.Now()
+		live := kept[:0]
+		for _, c := range kept {
+			if dte, err := c.DTE(now); err != nil || dte < 0 {
+				continue
+			}
+			live = append(live, c)
+		}
+		kept = live
 		chain.Contracts = kept
 		if len(chain.Contracts) == 0 {
 			continue
@@ -225,11 +236,25 @@ func (s *Service) restoreBootState(entries *[]TickerConfig, customSet *bool) err
 		if snap, ok := bs.LastSnapshots[chain.Ticker]; ok {
 			savedAsOf = snap.AsOfMs
 		}
+		// a saved chain with nothing beyond same-day expiry cannot price
+		// (0DTE is outside the model horizon): restore the ticker with an
+		// EMPTY book — the engine idles until the edge re-delivers a chain
+		// instead of failing every recompute pass
+		tradable := false
+		for _, c := range chain.Contracts {
+			if dte, err := c.DTE(now); err == nil && dte >= 1 {
+				tradable = true
+				break
+			}
+		}
+		if !tradable {
+			s.cfg.Logger("app: boot %s: saved chain has no contracts with DTE >= 1 — awaiting edge re-discovery", chain.Ticker)
+		}
 		if known {
 			if u.BaselineIV > 0 {
 				entry.Vol = u.BaselineIV
 			}
-			h, err := s.restoreTicker(chain, entry, u.BaselineIV, savedAsOf)
+			h, err := s.restoreTicker(chain, entry, u.BaselineIV, savedAsOf, tradable)
 			if err != nil {
 				return err
 			}
@@ -245,7 +270,7 @@ func (s *Service) restoreBootState(entries *[]TickerConfig, customSet *bool) err
 			Spot: u.Spot, Vol: max(0.05, u.BaselineIV), Custom: true,
 		}
 		*customSet = true
-		h, err := s.restoreTicker(chain, entry, entry.Vol, savedAsOf)
+		h, err := s.restoreTicker(chain, entry, entry.Vol, savedAsOf, tradable)
 		if err != nil {
 			return err
 		}
@@ -269,11 +294,16 @@ func entryForTicker(entries []TickerConfig, ticker string) (TickerConfig, bool) 
 // restoreTicker builds a handle from a restored chain: book + engine + the
 // as-of of the ticker's last persisted snapshot, ready to register in
 // s.handles. baselineIV is the restored effective vol the engine anchors on.
-func (s *Service) restoreTicker(chain market.ChainSnapshot, entry TickerConfig, baselineIV float64, savedAsOf int64) (*tickerHandle, error) {
+// tradable=false (nothing with DTE >= 1 left) installs the handle with an
+// EMPTY book: the engine idles silently until the edge applies a fresh chain,
+// instead of erroring on every recompute pass.
+func (s *Service) restoreTicker(chain market.ChainSnapshot, entry TickerConfig, baselineIV float64, savedAsOf int64, tradable bool) (*tickerHandle, error) {
 	h := &tickerHandle{cfg: entry, vol: max(0.05, baselineIV), book: market.NewInMemoryBook()}
 	h.eng = s.engineFor(h)
-	if err := h.book.ApplyChainSnapshot(context.Background(), chain); err != nil {
-		return nil, fmt.Errorf("app: boot chain %s: %w", chain.Ticker, err)
+	if tradable {
+		if err := h.book.ApplyChainSnapshot(context.Background(), chain); err != nil {
+			return nil, fmt.Errorf("app: boot chain %s: %w", chain.Ticker, err)
+		}
 	}
 	h.saved = savedAsOf
 	return h, nil
@@ -294,7 +324,7 @@ func (s *Service) engineFor(h *tickerHandle) *exposure.Engine {
 			}
 		}
 	}
-	return exposure.NewEngine(h.book, sigma, exposure.Config{
+	eng := exposure.NewEngine(h.book, sigma, exposure.Config{
 		Ticker:      h.cfg.Ticker,
 		R:           0.043,
 		Q:           0.015,
@@ -302,6 +332,8 @@ func (s *Service) engineFor(h *tickerHandle) *exposure.Engine {
 		FlipEvery:   s.cfg.FlipEvery,
 		BlendIVs:    s.cfg.LiveBlend,
 	})
+	eng.SetLogger(s.cfg.Logger) // recompute failures flow through the app logger
+	return eng
 }
 
 // addHandle seeds a fresh synthetic chain for the entry (expiry traversal +

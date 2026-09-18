@@ -479,6 +479,7 @@ function renderStatus() {
     setText(el, on ? "live" : "off");
     setClass(el, `stream-state ${on ? "on" : ""}`);
   }
+  setText($("stream-mode"), s.mode || "—");
   setText($("stream-updates"), s.updates.toLocaleString());
   setText($("stream-last"), s.lastUpdateMs ? fmtTime(s.lastUpdateMs) : "—");
   setText($("stream-saved"), s.savedAsOfMs ? fmtTime(s.savedAsOfMs) : "—");

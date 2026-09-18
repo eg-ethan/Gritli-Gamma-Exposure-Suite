@@ -121,6 +121,10 @@ type tickerIngest struct {
 	patchCount int
 	pending    bool
 	persisted  map[int64]bool
+	// nextSyn is the per-session monotonic counter behind placeholder conId
+	// allocation (see adoptChainLocked): never reset, so a re-discovery can
+	// never reissue an id an unresolved row still holds.
+	nextSyn int64
 }
 
 // NewCore wires the ingest core. diag may be nil (a fresh collector is
@@ -407,7 +411,7 @@ func (c *Core) onChain(sess *Session, env Envelope) []Outbound {
 	c.adoptChainLocked(ev.Ticker, filtered)
 	c.mu.Unlock()
 
-	if err := c.sink.ApplyChain(context.Background(), filtered); err != nil {
+	if err := c.publishLocked(ev.Ticker, filtered); err != nil {
 		c.diag.bumpApplyFailed()
 		return []Outbound{c.errorReply(env, "apply_failed", err.Error())}
 	}
@@ -449,22 +453,33 @@ func strikeWindows(chain market.ChainSnapshot) []StrikeWindow {
 }
 
 // buildSkeleton expands the universe into contracts: every (listing, strike,
-// right). conIds are ticker-namespaced placeholders until the first optcomp
-// swaps in the real (positive) IBKR Con_Id — the durable-key decision applied
-// to a discovery payload that carries none.
+// right), WITHOUT conIds. Placeholder ids are stamped by adoptChainLocked
+// after selection, only over the rows that survive — numbering the full
+// universe here (100k+ rows on a live SPX discovery) overflowed the ticker's
+// namespace slot and the spilled ids were dropped as foreign at boot
+// restore (live 2026-09-18: SPX/NDX restored with 0DTE-only books). The
+// first optcomp swaps the placeholder for the real (positive) IBKR Con_Id —
+// the durable-key decision applied to a discovery payload that carries none.
 func (c *Core) buildSkeleton(ev ChainEvent) market.ChainSnapshot {
 	snap := market.ChainSnapshot{
 		Ticker: ev.Ticker, Spot: ev.Spot, AsOfMs: maxI64(ev.AsOfMs, c.cfg.Now().UnixMilli()),
 		UnderlyingType: ev.UnderlyingType, Exchange: ev.Exchange,
 	}
-	base := market.SyntheticConIDBase(ev.Ticker)
-	n := 0
+	type idKey struct {
+		class, expiry, right string
+		strike               float64
+	}
+	seen := make(map[idKey]struct{}, len(ev.Listings)*len(ev.Strikes)*2)
 	for _, l := range ev.Listings {
 		for _, k := range ev.Strikes {
 			for _, right := range []string{market.RightCall, market.RightPut} {
-				n++
+				id := idKey{class: l.TradingClass, expiry: l.Date, right: right, strike: k}
+				if _, dup := seen[id]; dup {
+					continue // TWS can re-list a (class, expiry) pair — one row per identity, not two (duplicate rows would collide in the re-discovery carryover)
+				}
+				seen[id] = struct{}{}
 				snap.Contracts = append(snap.Contracts, market.Contract{
-					ConId: base - int64(n), Ticker: ev.Ticker, Strike: k, Right: right,
+					Ticker: ev.Ticker, Strike: k, Right: right,
 					ExpiryDate: l.Date, TradingClass: l.TradingClass, Settlement: l.Settlement,
 					Multiplier: market.DefaultMultiplier, Exchange: ev.Exchange,
 					SDTier: math.NaN(), // stamped by FilterChain below
@@ -481,6 +496,7 @@ func (c *Core) buildSkeleton(ev ChainEvent) market.ChainSnapshot {
 // re-discovery must not zero the book while OI re-arrives).
 func (c *Core) adoptChainLocked(ticker string, filtered market.ChainSnapshot) {
 	ti := c.tickers[ticker]
+	reseen := ti != nil
 	if ti == nil {
 		ti = &tickerIngest{byCon: map[int64]int{}, lastIV: map[int64]float64{}, persisted: map[int64]bool{}}
 		c.tickers[ticker] = ti
@@ -507,12 +523,35 @@ func (c *Core) adoptChainLocked(ticker string, filtered market.ChainSnapshot) {
 		}
 		c.diag.anomaly(AnomalyChainReplace, ticker, 0,
 			fmt.Sprintf("chain re-discovered: %d → %d contracts, %d carried over", len(old.Contracts), len(filtered.Contracts), carry))
-		// re-discovery re-persists the whole kept chain once (identities and
-		// settlement classes may have changed with the new universe)
-		if c.cons != nil && len(filtered.Contracts) > 0 {
-			if err := c.cons.UpsertContractsSource(filtered.Contracts, "edge"); err != nil {
-				c.diag.bumpWriteFailed(fmt.Sprintf("contract upsert on re-discovery: %v", err))
-			}
+	}
+
+	// Stamp placeholder conIds on rows the carryover left bare (every row on a
+	// first discovery): allocated from a per-ticker monotonic counter over the
+	// SELECTED chain only, so ids stay unique and inside the ticker's
+	// namespace slot however large the discovered universe was.
+	base := market.SyntheticConIDBase(ticker)
+	for i := range filtered.Contracts {
+		if filtered.Contracts[i].ConId != 0 {
+			continue
+		}
+		ti.nextSyn++
+		if ti.nextSyn == market.ConIdSlotWidth+1 {
+			c.diag.anomaly(AnomalyNamespace, ticker, 0,
+				fmt.Sprintf("placeholder ids exhausted the %d-wide namespace slot — further ids spill into foreign slots and drop at boot restore", market.ConIdSlotWidth))
+		}
+		filtered.Contracts[i].ConId = base - ti.nextSyn
+	}
+
+	// re-discovery re-persists the whole kept chain once (identities and
+	// settlement classes may have changed with the new universe, and the
+	// freshly stamped ids must land in Option_Contracts). The rows are
+	// copied: the write runs on the async store writer while optcomp patches
+	// keep mutating the working array under this lock.
+	if reseen && c.cons != nil && len(filtered.Contracts) > 0 {
+		rows := make([]market.Contract, len(filtered.Contracts))
+		copy(rows, filtered.Contracts)
+		if err := c.cons.UpsertContractsSource(rows, "edge"); err != nil {
+			c.diag.bumpWriteFailed(fmt.Sprintf("contract upsert on re-discovery: %v", err))
 		}
 	}
 	ti.chain = filtered
@@ -736,11 +775,22 @@ func (c *Core) flushTickerLocked(ticker string) {
 	ti.patchCount = 0
 	out := ti.chain
 	out.AsOfMs = c.cfg.Now().UnixMilli()
-	if err := c.sink.ApplyChain(context.Background(), out); err != nil {
+	if err := c.publishLocked(ticker, out); err != nil {
 		c.diag.bumpApplyFailed()
 		return
 	}
 	c.diag.appliedOne()
+}
+
+// publishLocked hands the working chain to the book as a FROZEN copy. The
+// working backing array stays mutable by optcomp patches under c.mu; the
+// book's array must honor ApplyChainSnapshot's read-only contract — handing
+// out the live array let readers (engine, GUI) observe patches mid-write.
+func (c *Core) publishLocked(ticker string, snap market.ChainSnapshot) error {
+	frozen := snap
+	frozen.Contracts = make([]market.Contract, len(snap.Contracts))
+	copy(frozen.Contracts, snap.Contracts)
+	return c.sink.ApplyChain(context.Background(), frozen)
 }
 
 // findSkeletonRow matches an optcomp to an unresolved skeleton row by its

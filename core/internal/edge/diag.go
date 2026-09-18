@@ -84,6 +84,7 @@ const (
 	AnomalyApplyFailed    = "apply_failed"  // book rejected a flush
 	AnomalyWriteFailed    = "write_failed"  // computation-log write failed
 	AnomalyStaleEvent     = "stale_event"   // event older than the applied book state
+	AnomalyNamespace      = "namespace_overflow" // placeholder conId allocation left the ticker's namespace slot
 
 	AnomalyVendorOIEmpty = "vendor_oi_empty" // vendor OI refresh matched 0 contracts (mapping/universe drift)
 )

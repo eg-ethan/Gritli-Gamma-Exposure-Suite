@@ -90,6 +90,12 @@ func TestEdgeSinkRoutesChainAndComputes(t *testing.T) {
 // totals — the thing the dashboard renders.
 func TestEdgeBooksComputeNonZeroGEX(t *testing.T) {
 	now := func() time.Time { return time.Date(2026, 9, 14, 15, 0, 0, 0, time.UTC) }
+	// expiry fixtures must stay ≥1 DTE at the REAL clock the engines run on
+	// (engines use time.Now; the fixed seed clock above never reaches them) —
+	// hardcoded 2026-09-16/18 dates rotted on 2026-09-18: both books went
+	// 0DTE and the engines never computed a snapshot.
+	exp2 := time.Now().UTC().AddDate(0, 0, 2).Format("20060102")
+	exp4 := time.Now().UTC().AddDate(0, 0, 4).Format("20060102")
 	s, err := New(Config{DBPath: "", Now: now})
 	if err != nil {
 		t.Fatal(err)
@@ -123,16 +129,16 @@ func TestEdgeBooksComputeNonZeroGEX(t *testing.T) {
 
 	// NDX: the real shape — AM monthly under NDX, PM weekly+monthly under NDXP
 	if err := s.ApplyChain(context.Background(), mk("NDX", 25200, []classSpec{
-		{"NDX", "20260918", market.SettlementAM, []float64{25100, 25200, 25300}},
-		{"NDXP", "20260916", market.SettlementPM, []float64{25150, 25200, 25250}},
-		{"NDXP", "20260918", market.SettlementPM, []float64{25100, 25200, 25300}},
+		{"NDX", exp4, market.SettlementAM, []float64{25100, 25200, 25300}},
+		{"NDXP", exp2, market.SettlementPM, []float64{25150, 25200, 25250}},
+		{"NDXP", exp4, market.SettlementPM, []float64{25100, 25200, 25300}},
 	})); err != nil {
 		t.Fatal(err)
 	}
 	// equity: TSLA + the live-observed 2TSLA secondary class
 	if err := s.ApplyChain(context.Background(), mk("TSLA", 369, []classSpec{
-		{"TSLA", "20260918", "", []float64{360, 365, 370}},
-		{"2TSLA", "20260916", "", []float64{365, 368}},
+		{"TSLA", exp4, "", []float64{360, 365, 370}},
+		{"2TSLA", exp2, "", []float64{365, 368}},
 	})); err != nil {
 		t.Fatal(err)
 	}

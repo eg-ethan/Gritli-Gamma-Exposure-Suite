@@ -43,6 +43,16 @@ func TestSyntheticConIdNamespace(t *testing.T) {
 	if ConIdMatchesTicker(-1, "SPY") {
 		t.Fatal("sequential legacy id -1 must not match the namespaced slot")
 	}
+	// the full slot range belongs to the ticker; the first id past it doesn't
+	// (allocators that run past the edge spill into a foreign slot and their
+	// rows drop at boot restore — live 2026-09-18)
+	base := SyntheticConIDBase("SPY")
+	if !ConIdMatchesTicker(base-1, "SPY") || !ConIdMatchesTicker(base-ConIdSlotWidth, "SPY") {
+		t.Fatal("slot edges (base-1, base-ConIdSlotWidth) must match their ticker")
+	}
+	if ConIdMatchesTicker(base-ConIdSlotWidth-1, "SPY") {
+		t.Fatal("first id past the slot must not match")
+	}
 	// the shipped watchlist tickers occupy distinct slots (per-ticker bases)
 	for _, a := range []string{"SPY", "NDX", "TSLA", "VIX"} {
 		for _, b := range []string{"SPY", "NDX", "TSLA", "VIX"} {
