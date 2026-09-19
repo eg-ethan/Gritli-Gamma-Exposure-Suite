@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,8 +58,8 @@ type Config struct {
 	// IVJumpRel is the relative quoted-IV move between updates that trips an
 	// iv_jump anomaly (default 0.5 = 50%).
 	IVJumpRel float64
-	Now    func() time.Time
-	Logger func(format string, args ...any)
+	Now       func() time.Time
+	Logger    func(format string, args ...any)
 }
 
 func (c Config) withDefaults() Config {
@@ -100,13 +101,14 @@ type Core struct {
 	points PointSink
 	diag   *Diagnostics
 
-	mu          sync.Mutex
-	tickers     map[string]*tickerIngest
-	pendLogs    []store.ComputationLog
-	pendPoints  []store.DataPoint
-	logErrs     []<-chan error
-	pointErrs   []<-chan error
-	lastStatus  *StatusEvent
+	mu         sync.Mutex
+	tickers    map[string]*tickerIngest
+	spotOnly   map[string]bool // spot_sub-registered tickers (hedge benchmark): spot applies with no chain
+	pendLogs   []store.ComputationLog
+	pendPoints []store.DataPoint
+	logErrs    []<-chan error
+	pointErrs  []<-chan error
+	lastStatus *StatusEvent
 }
 
 // tickerIngest is one underlying's working chain: the filtered skeleton from
@@ -140,11 +142,12 @@ func NewCore(sink BookSink, logs LogSink, cfg Config, diag *Diagnostics) *Core {
 		diag = newDiagnostics(cfg.Now)
 	}
 	c := &Core{
-		cfg:     cfg,
-		sink:    sink,
-		logs:    logs,
-		diag:    diag,
-		tickers: map[string]*tickerIngest{},
+		cfg:      cfg,
+		sink:     sink,
+		logs:     logs,
+		diag:     diag,
+		tickers:  map[string]*tickerIngest{},
+		spotOnly: map[string]bool{},
 	}
 	if isNilSink(logs) {
 		c.logs = nil
@@ -318,6 +321,11 @@ func (c *Core) Dispatch(sess *Session, env Envelope) []Outbound {
 		}
 		c.onSpot(sess, env)
 		return nil
+	case TypeSpotSub:
+		if !c.requireHello(sess, env) {
+			return nil
+		}
+		return c.onSpotSub(sess, env)
 	case TypeTrade, TypeDepth:
 		if !c.requireHello(sess, env) {
 			return nil
@@ -599,6 +607,37 @@ func (c *Core) LastStatus() *StatusEvent {
 	return c.lastStatus
 }
 
+// onSpotSub registers a spot-only ticker (the hedge benchmark, spec §3): L1
+// spot will arrive with no chain, no discovery, no sub_set. Idempotent; a
+// later chain event for the same ticker is independent and fine.
+func (c *Core) onSpotSub(sess *Session, env Envelope) []Outbound {
+	var sub SpotSub
+	if err := json.Unmarshal(env.Data, &sub); err != nil || !validSpotTicker(sub.Ticker) {
+		c.diag.rejectedOne()
+		return []Outbound{c.errorReply(env, "bad_ticker", fmt.Sprintf("spot_sub ticker %q", sub.Ticker))}
+	}
+	ticker := strings.ToUpper(sub.Ticker)
+	c.mu.Lock()
+	c.spotOnly[ticker] = true
+	c.mu.Unlock()
+	return []Outbound{{Type: TypeSpotAck, ID: env.ID, TS: c.cfg.Now().UnixMilli(), Data: SpotAck{Ticker: ticker}}}
+}
+
+// validSpotTicker is the wire-level shape check for spot_sub (the app layer
+// applies its own semantics — registered tickers only apply when the host
+// has a use for them).
+func validSpotTicker(t string) bool {
+	if t == "" || len(t) > 10 {
+		return false
+	}
+	for _, r := range t {
+		if !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // onSpot applies an underlying tick immediately (cheap; keeps the book's
 // spot fresher than the chain-flush cadence).
 func (c *Core) onSpot(sess *Session, env Envelope) {
@@ -608,15 +647,14 @@ func (c *Core) onSpot(sess *Session, env Envelope) {
 		return
 	}
 	c.mu.Lock()
-	_, known := c.tickers[ev.Ticker]
-	if known { // keep the working chain's spot in step with the book
-		if ti := c.tickers[ev.Ticker]; ev.Price > 0 {
-			ti.chain.Spot = ev.Price
-			ti.chain.AsOfMs = maxI64(ti.chain.AsOfMs, env.TS)
-		}
+	ti, known := c.tickers[ev.Ticker]
+	if known && ev.Price > 0 { // keep the working chain's spot in step with the book
+		ti.chain.Spot = ev.Price
+		ti.chain.AsOfMs = maxI64(ti.chain.AsOfMs, env.TS)
 	}
+	spotOnly := c.spotOnly[ev.Ticker]
 	c.mu.Unlock()
-	if !known {
+	if !known && !spotOnly {
 		c.diag.rejectedOne()
 		c.diag.anomaly(AnomalyUnknownTicker, ev.Ticker, 0, "spot before chain discovery")
 		return

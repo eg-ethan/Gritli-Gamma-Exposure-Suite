@@ -8,6 +8,8 @@ the proto.go spec, can drive the REAL Go server end to end:
 
     hello  -> welcome
     chain  -> sub_set (selection math the core owns)
+    spot_sub -> spot_ack (hedge benchmark registration; its spot applies
+               with no chain)
     optcomp patches land in the book (spot observable via /api/state or the
              app book)
     seq gaps and malformed lines are detected server-side
@@ -194,6 +196,22 @@ def main() -> int:
     cli.send("spot", {"ticker": "SPX", "price": 6610.25}, seq=cli.seq + 50)
     cli.send("ping")
     check("seq gap tolerated (resync)", cli.expect("pong").get("type") == "pong")
+
+    # 8. spot-only ticker (hedge benchmark, Phase 3): spot_sub -> spot_ack
+    #    correlated by id and normalized to upper; its spot never draws an
+    #    error reply; an UNregistered ticker's spot is an internal anomaly,
+    #    never a session-level failure
+    sub_id = 9002
+    cli.send("spot_sub", {"ticker": "cibr"}, msg_id=sub_id)
+    ack = cli.expect("spot_ack")
+    check("spot_sub acknowledged by id", ack.get("id") == sub_id and ack["data"]["ticker"] == "CIBR",
+          f"id={ack.get('id')} ticker={ack['data'].get('ticker')}")
+    cli.send("spot", {"ticker": "CIBR", "price": 30.25})
+    cli.send("ping")
+    check("registered spot accepted (no error)", cli.expect("pong").get("type") == "pong")
+    cli.send("spot", {"ticker": "NOCHN", "price": 10.0})
+    cli.send("ping")
+    check("unregistered spot keeps session alive", cli.expect("pong").get("type") == "pong")
 
     cli.close()
 

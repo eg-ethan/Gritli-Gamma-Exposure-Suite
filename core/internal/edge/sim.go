@@ -40,6 +40,10 @@ type SimConfig struct {
 	Tickers  []SimTicker
 	Interval time.Duration // tick cadence (default 250 ms)
 	Seed     uint64
+	// SpotOnly lists spot-sub-only tickers (the hedge benchmark): the sim
+	// announces each with spot_sub — no chain — and walks its L1 spot, the
+	// exact Phase-3 wire path the C# edge's --hedge-bench drives.
+	SpotOnly []SimTicker
 	// Scenarios enables the anomaly injections (multiplier amendment, IV
 	// jump, chain re-discovery). Disable for clean-load testing.
 	Scenarios bool
@@ -106,6 +110,11 @@ func RunSim(ctx context.Context, cfg SimConfig) (SimResult, error) {
 		}
 		res.ChainSend++
 	}
+	for _, t := range cfg.SpotOnly {
+		if err := s.sendSpotSub(t); err != nil {
+			return res, err
+		}
+	}
 
 	tick := 0
 	tk := time.NewTicker(cfg.Interval)
@@ -122,6 +131,11 @@ func RunSim(ctx context.Context, cfg SimConfig) (SimResult, error) {
 			tick++
 			for _, t := range cfg.Tickers {
 				if err := s.tick(t, tick); err != nil {
+					return res, err
+				}
+			}
+			for _, t := range cfg.SpotOnly {
+				if err := s.tickSpotOnly(t); err != nil {
 					return res, err
 				}
 			}
@@ -180,6 +194,35 @@ func (s *simClient) handshake() error {
 		return err
 	}
 	return s.w.Flush()
+}
+
+// sendSpotSub announces one spot-only ticker and seeds its walk. The ack
+// arrives asynchronously (readLoop tolerates it); the core accepts the
+// registration before any spot flows.
+func (s *simClient) sendSpotSub(t SimTicker) error {
+	if s.spots == nil {
+		s.spots = map[string]float64{}
+	}
+	s.spots[t.Ticker] = t.Spot
+	if err := s.send(TypeSpotSub, s.seq+1, SpotSub{Ticker: t.Ticker}); err != nil {
+		return err
+	}
+	return s.w.Flush()
+}
+
+// tickSpotOnly walks one spot-only ticker's L1 line — the Phase-3 benchmark
+// path: plain spot events, no chain, no optcomp.
+func (s *simClient) tickSpotOnly(t SimTicker) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	spot := s.spots[t.Ticker]
+	spot *= 1 + s.rng.NormFloat64()*0.0004
+	spot = math.Max(t.Spot*0.95, math.Min(t.Spot*1.05, spot))
+	s.spots[t.Ticker] = spot
+	if err := s.send(TypeSpot, 0, SpotEvent{Ticker: t.Ticker, Price: round2(spot)}); err != nil {
+		return err
+	}
+	return nil
 }
 
 // sendChain discovers one ticker's full universe (deterministic generator)
@@ -272,6 +315,8 @@ func (s *simClient) readLoop() error {
 			}
 			s.replies[env.ID] = sub
 			s.mu.Unlock()
+		case TypeSpotAck:
+			// registration landed; spots may flow
 		case TypeError:
 			var e ErrorMsg
 			if json.Unmarshal(env.Data, &e) == nil {
@@ -364,7 +409,7 @@ func dteOf(yyyymmdd string) float64 {
 	if err != nil {
 		return 0
 	}
-	return d.Sub(time.Now().UTC().Truncate(24 * time.Hour)).Hours() / 24
+	return d.Sub(time.Now().UTC().Truncate(24*time.Hour)).Hours() / 24
 }
 
 func firstStrike(book []market.Contract) float64 {

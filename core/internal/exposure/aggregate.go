@@ -11,6 +11,7 @@ import (
 	"gexcore/internal/rootfind"
 	"gexcore/internal/solver"
 	"gexcore/internal/volblend"
+	"strconv"
 )
 
 // BookInputs is everything ComputeSnapshot needs: the chain, pricing config,
@@ -472,4 +473,89 @@ func blendedVols(in BookInputs, multiClass bool) []float64 {
 			volblend.QuoteOf(c.Bid, c.Ask), ref.quote)
 	}
 	return vols
+}
+
+// LegRef identifies one option position to price: by conId when the chain has
+// resolved it, else by (trading class, expiry, right, strike) — the same
+// identity discipline the edge ingest applies to unresolved rows.
+type LegRef struct {
+	ConId        int64
+	TradingClass string
+	Expiry       string
+	Right        string
+	Strike       float64
+}
+
+// LegPrice is one priced leg: the solver's BS2002 delta at the SAME vol the
+// engine prices that contract at (volblend when LiveBlend, else the per-expiry
+// anchor), the chain's multiplier, and Ok=false when the leg did not resolve
+// against the chain (unknown contract, or expired past the model horizon —
+// it contributes zero delta and the panel flags it).
+type LegPrice struct {
+	Delta      float64
+	Multiplier float64
+	Ok         bool
+}
+
+// ContractDeltas prices position legs through the exact pipeline
+// ComputeSnapshot uses — the hedge module's per-leg delta seam (locked
+// decision 2, architecture.md §12). The blend is built ONCE for the whole
+// batch so every leg sees the same surface the engine's snapshot saw.
+func ContractDeltas(in BookInputs, refs []LegRef) []LegPrice {
+	out := make([]LegPrice, len(refs))
+	if len(refs) == 0 {
+		return out
+	}
+	classSet := make(map[string]struct{})
+	for i := range in.Chain.Contracts {
+		classSet[in.Chain.Contracts[i].TradingClass] = struct{}{}
+	}
+	var vols []float64
+	if in.LiveBlend {
+		vols = blendedVols(in, len(classSet) > 1)
+	}
+
+	byCon := make(map[int64]int, len(in.Chain.Contracts))
+	byKey := make(map[string]int, len(in.Chain.Contracts))
+	key := func(class, expiry, right string, strike float64) string {
+		return class + "\x00" + expiry + "\x00" + right + "\x00" +
+			strconv.FormatFloat(strike, 'f', -1, 64)
+	}
+	for i := range in.Chain.Contracts {
+		c := &in.Chain.Contracts[i]
+		if c.ConId != 0 {
+			byCon[c.ConId] = i
+		}
+		if _, taken := byKey[key(c.TradingClass, c.ExpiryDate, c.Right, c.Strike)]; !taken {
+			byKey[key(c.TradingClass, c.ExpiryDate, c.Right, c.Strike)] = i
+		}
+	}
+
+	for r, ref := range refs {
+		idx, found := -1, false
+		if ref.ConId != 0 {
+			idx, found = byCon[ref.ConId]
+		}
+		if !found {
+			idx, found = byKey[key(ref.TradingClass, ref.Expiry, ref.Right, ref.Strike)]
+		}
+		if !found {
+			continue
+		}
+		c := &in.Chain.Contracts[idx]
+		dte, err := c.DTE(in.AsOf)
+		if err != nil || dte < 1 {
+			continue // expired legs price at zero — outside the model horizon
+		}
+		vol := in.Sigma.SigmaBar(dte)
+		if vols != nil {
+			vol = vols[idx]
+		}
+		g, err := solver.ComputeGreeks(in.Spot, c.Strike, dte/365.0, in.R, in.Q, vol, c.Right)
+		if err != nil {
+			continue // a leg the solver rejects contributes zero, flagged not fatal
+		}
+		out[r] = LegPrice{Delta: g.Delta, Multiplier: c.Multiplier, Ok: true}
+	}
+	return out
 }

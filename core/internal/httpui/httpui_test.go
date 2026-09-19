@@ -3,6 +3,7 @@ package httpui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -278,5 +279,72 @@ func TestEventsStreamInitial(t *testing.T) {
 	}
 	if !strings.Contains(head.String(), `"ticker":"TSLA"`) {
 		t.Fatal("initial event missing the bound ticker's payload")
+	}
+}
+
+// TestHedgeEndpoints: the hedge surface — GET /api/hedge, pair set,
+// position add/delete — through the same guard and JSON discipline the GUI
+// uses.
+func TestHedgeEndpoints(t *testing.T) {
+	srv, err := NewServer(testService(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("GET", "/api/hedge", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/hedge: %d", rec.Code)
+	}
+	var st app.HedgeState
+	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil || st.State != app.HedgeNoPair {
+		t.Fatalf("initial hedge state = %+v err=%v", st, err)
+	}
+
+	// bad pair (asset not on watchlist) → 409
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("POST", "/api/hedge-pair", strings.NewReader(`{"asset":"PANW","benchmark":"CIBR"}`)))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("bad pair: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// good pair
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("POST", "/api/hedge-pair", strings.NewReader(`{"asset":"SPY","benchmark":"CIBR"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pair set: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// share leg
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("POST", "/api/positions", strings.NewReader(`{"kind":"share","shares":100}`)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("share leg: %d %s", rec.Code, rec.Body.String())
+	}
+	var leg struct {
+		Id int64 `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &leg); err != nil || leg.Id == 0 {
+		t.Fatalf("share leg body: %s", rec.Body.String())
+	}
+
+	// invalid leg → 400
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("POST", "/api/positions", strings.NewReader(`{"kind":"option","right":"C","expiry":"20261218","strike":0,"contracts":1}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad leg: %d", rec.Code)
+	}
+
+	// delete + unknown delete
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodDelete, "/api/positions/"+fmt.Sprint(leg.Id), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodDelete, "/api/positions/999", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown delete: %d", rec.Code)
 	}
 }

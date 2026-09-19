@@ -341,3 +341,30 @@ body.has-sweep-banner #app { padding-top: 40px; }
 }
 .tick-btn .sweep-dot.fast { background: var(--neg); }
 .tick-btn .sweep-dot.live { animation: pulse 1.2s ease-in-out infinite; }
+
+/* ── Beta hedge panel ── */
+.hedge-pair { display: flex; gap: 6px; margin-bottom: 8px; }
+.hedge-pair select {
+  background: var(--bg-raise); color: var(--ink); border: 1px solid var(--panel-edge);
+  border-radius: 6px; padding: 4px 6px; font-size: 12px; min-width: 0; flex: 1;
+}
+.hedge-pair input {
+  width: 84px; background: var(--bg-raise); color: var(--ink);
+  border: 1px solid var(--panel-edge); border-radius: 6px; padding: 4px 8px;
+  font-size: 12px; text-transform: uppercase;
+}
+.hedge-pair input:focus, .hedge-pair select:focus { outline: 1px solid var(--accent); }
+.hedge-target { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0; }
+.hedge-legs { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.hedge-leg {
+  display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; align-items: center;
+  background: var(--bg-raise); border: 1px solid var(--panel-edge);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px;
+}
+.hedge-leg-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hedge-leg-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.hedge-leg-form select, .hedge-leg-form input {
+  background: var(--bg-raise); color: var(--ink); border: 1px solid var(--panel-edge);
+  border-radius: 6px; padding: 4px 6px; font-size: 12px; width: 86px;
+}
+.hedge-leg-form #leg-shares { width: 76px; }

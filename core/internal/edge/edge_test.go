@@ -92,6 +92,25 @@ func (c *testClient) send(typ string, data any) {
 	c.sendSeq(0, typ, data)
 }
 
+// sendCorrelated is send with a request id (chain→sub_set, spot_sub→spot_ack).
+func (c *testClient) sendCorrelated(id int64, typ string, data any) {
+	c.t.Helper()
+	c.seq++
+	out := Outbound{Seq: c.seq, Type: typ, TS: time.Now().UnixMilli(), ID: id, Data: data}
+	b, err := encodeOutbound(out)
+	if err != nil {
+		c.t.Fatalf("encode %s: %v", typ, err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, err := c.w.Write(append(b, '\n')); err != nil {
+		c.t.Fatalf("write %s: %v", typ, err)
+	}
+	if err := c.w.Flush(); err != nil {
+		c.t.Fatalf("flush %s: %v", typ, err)
+	}
+}
+
 func (c *testClient) sendSeq(seq int64, typ string, data any) {
 	c.t.Helper()
 	if seq == 0 {
@@ -1140,4 +1159,154 @@ func TestBigUniverseConIdsStayInNamespace(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("optcomp never resolved to a book row")
+}
+
+// TestSpotSubRegistration: the Phase-3 spot-only path (hedge benchmark) —
+// spot_sub acks correlated by id and normalizes the ticker; a registered
+// ticker's spot applies with NO chain and draws no unknown-ticker anomaly;
+// an unregistered ticker's spot is rejected server-side and never reaches
+// the sink; a malformed registration is an error reply.
+func TestSpotSubRegistration(t *testing.T) {
+	sink := newFakeSink()
+	srv, core := newTestServer(t, sink, nil)
+	cl := dial(t, srv.Addr().String())
+
+	cl.send(TypeHello, Hello{Instance: "test-edge"})
+	if rep := cl.readReply(); rep.Type != TypeWelcome {
+		t.Fatalf("hello reply = %s", rep.Type)
+	}
+
+	// malformed registration -> error reply, session alive
+	cl.sendCorrelated(7001, TypeSpotSub, SpotSub{Ticker: "BAD!!TICKER"})
+	if rep := cl.readReply(); rep.Type != TypeError {
+		t.Fatalf("bad spot_sub reply = %s, want error", rep.Type)
+	}
+
+	// registration acks by id, uppercased
+	cl.sendCorrelated(7002, TypeSpotSub, SpotSub{Ticker: "cibr"})
+	rep := cl.readReply()
+	if rep.Type != TypeSpotAck || rep.ID != 7002 {
+		t.Fatalf("spot_sub reply = %s id=%d, want spot_ack id=7002", rep.Type, rep.ID)
+	}
+	var ack SpotAck
+	if err := json.Unmarshal(rep.Data, &ack); err != nil || ack.Ticker != "CIBR" {
+		t.Fatalf("spot_ack payload = %s", rep.Data)
+	}
+
+	// registered spot applies with no chain
+	cl.send(TypeSpot, SpotEvent{Ticker: "CIBR", Price: 30.25})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !sink.hasSpot("CIBR") {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := sink.spot("CIBR"); !sink.hasSpot("CIBR") || got != 30.25 {
+		t.Fatalf("registered spot did not apply: has=%v value=%v", sink.hasSpot("CIBR"), got)
+	}
+	d := core.Diagnostics()
+	if n := d.Read().Anomalies; len(n) > 0 {
+		t.Fatalf("registered spot must draw no anomalies, got %v", n)
+	}
+
+	// unregistered spot: rejected server-side, sink untouched
+	cl.send(TypeSpot, SpotEvent{Ticker: "NOCHN", Price: 10.0})
+	time.Sleep(50 * time.Millisecond)
+	if sink.hasSpot("NOCHN") {
+		t.Fatal("unregistered spot must not reach the sink")
+	}
+	cl.send(TypePing, nil)
+	if rep := cl.readReply(); rep.Type != TypePong {
+		t.Fatalf("session must survive unregistered spot, got %s", rep.Type)
+	}
+}
+
+// TestFeedsGateFreezeSpotOnly pins the freeze verdict from the 2026-09-19
+// smoke review (docs/HANDOFF-2026-09-19.md open item 2): a spot_sub ticker's
+// L1 line — the hedge benchmark path, with no chain of its own — is frozen by
+// SetFeeds(false) exactly like every other inbound event. The live repro
+// (serve --edge-sim, GUI Disconnect, benchSpot pinned while the sim, which
+// ignores pause, kept sending) confirmed the gate already covers it; the
+// "post-disconnect bench advance" observed in the smoke was pre-disconnect
+// streaming — the journal shows the final spot landing 110 ms BEFORE the
+// pause push, which is the last record. This test keeps it that way.
+func TestFeedsGateFreezeSpotOnly(t *testing.T) {
+	sink := newFakeSink()
+	srv, _ := newTestServer(t, sink, nil)
+
+	c := dial(t, srv.Addr().String())
+	c.send(TypeHello, Hello{Instance: "spot-only-freeze"})
+	if rep := c.readReply(); rep.Type != TypeWelcome {
+		t.Fatalf("hello reply = %s, want welcome", rep.Type)
+	}
+	c.sendCorrelated(8001, TypeSpotSub, SpotSub{Ticker: "CIBR"})
+	if rep := c.readReply(); rep.Type != TypeSpotAck {
+		t.Fatalf("spot_sub reply = %s, want spot_ack", rep.Type)
+	}
+	c.send(TypeSpot, SpotEvent{Ticker: "CIBR", Price: 200.24})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && sink.spot("CIBR") != 200.24 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := sink.spot("CIBR"); got != 200.24 {
+		t.Fatalf("pre-freeze spot did not apply: %v", got)
+	}
+
+	srv.SetFeeds(false)
+	if rep := c.readReply(); rep.Type != TypePause {
+		t.Fatalf("freeze push = %s, want pause", rep.Type)
+	}
+	c.send(TypeSpot, SpotEvent{Ticker: "CIBR", Price: 201.85})
+	time.Sleep(150 * time.Millisecond)
+	if got := sink.spot("CIBR"); got != 200.24 {
+		t.Fatalf("spot-only ticker advanced while frozen: %v", got)
+	}
+
+	srv.SetFeeds(true)
+	if rep := c.readReply(); rep.Type != TypeResume {
+		t.Fatalf("resume push = %s, want resume", rep.Type)
+	}
+	c.send(TypeSpot, SpotEvent{Ticker: "CIBR", Price: 201.9})
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && sink.spot("CIBR") != 201.9 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := sink.spot("CIBR"); got != 201.9 {
+		t.Fatalf("spot-only ticker did not resume after unfreeze: %v", got)
+	}
+}
+
+// TestSimulatorSpotOnly: the Phase-3 benchmark path through the REAL wire —
+// the sim announces the bench with spot_sub (no chain), walks its L1 spot,
+// and the sink receives it with no chain ever arriving for that ticker.
+func TestSimulatorSpotOnly(t *testing.T) {
+	sink := newFakeSink()
+	srv, core := newTestServer(t, sink, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := RunSim(ctx, SimConfig{
+		Addr:     srv.Addr().String(),
+		Tickers:  []SimTicker{{Ticker: "SPX", Spot: 6600, Vol: 0.15}},
+		SpotOnly: []SimTicker{{Ticker: "CIBR", Spot: 30}},
+		Interval: 5 * time.Millisecond,
+		Seed:     7,
+		// enough events for the chain flow plus several bench ticks
+		StopAfterNEvents: 120,
+	})
+	if err != nil {
+		t.Fatalf("RunSim: %v (stopped: %v)", err, res.StoppedErr)
+	}
+	if !sink.hasSpot("CIBR") {
+		t.Fatal("benchmark spot never applied through the wire")
+	}
+	if sink.spot("CIBR") <= 29 || sink.spot("CIBR") >= 31 {
+		t.Fatalf("benchmark spot walked outside its soft bounds: %v", sink.spot("CIBR"))
+	}
+	if _, hasChain := sink.chains["CIBR"]; hasChain {
+		t.Fatal("spot-only ticker must never receive a chain")
+	}
+	for _, a := range core.Diagnostics().Read().Anomalies {
+		if a.Ticker == "CIBR" {
+			t.Fatalf("benchmark drew an anomaly: %+v", a)
+		}
+	}
 }

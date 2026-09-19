@@ -224,6 +224,53 @@
         </div>
       </section>
 
+      <!-- Beta-weighted hedge (positions are YOUR book, not the dealer book) -->
+      <section class="panel" id="panel-hedge">
+        <div class="panel-head">
+          <h2><span class="accent">▎</span>Beta Hedge</h2>
+          <span class="muted small" id="hedge-state-badge">—</span>
+        </div>
+        <div class="panel-body stream-body">
+          <form id="hedge-pair-form" class="hedge-pair" autocomplete="off">
+            <select id="hedge-asset" aria-label="Hedge asset"></select>
+            <input id="hedge-bench" maxlength="10" placeholder="BENCH" spellcheck="false" aria-label="Benchmark ticker">
+            <button type="submit" class="btn btn-connect small">Set</button>
+          </form>
+          <div class="stream-stats muted small" id="hedge-stats">
+            <div><span>β (252d OLS)</span><span id="hedge-beta">—</span></div>
+            <div><span>ρ</span><span id="hedge-rho">—</span></div>
+            <div><span>Sessions</span><span id="hedge-n">—</span></div>
+            <div><span>σ asset / bench</span><span id="hedge-vols">—</span></div>
+          </div>
+          <div class="hedge-target" id="hedge-target">
+            <div class="tile"><div class="tile-label">Target shares</div><div class="tile-value" id="hedge-shares">—</div></div>
+            <div class="tile"><div class="tile-label">Hedge notional</div><div class="tile-value" id="hedge-notional">—</div></div>
+            <div class="tile"><div class="tile-label">Gross Δ$</div><div class="tile-value" id="hedge-dollar">—</div></div>
+          </div>
+          <div class="stream-stats muted small">
+            <div><span>Δ<sub>net</sub></span><span id="hedge-net">—</span></div>
+            <div><span id="hedge-pair-label">pair</span><span id="hedge-spots">—</span></div>
+          </div>
+          <div id="hedge-reason" class="hint muted small hidden"></div>
+          <div id="hedge-legs" class="hedge-legs"></div>
+          <form id="hedge-leg-form" class="hedge-leg-form" autocomplete="off">
+            <select id="leg-kind" aria-label="Leg kind">
+              <option value="share">shares</option>
+              <option value="option">option</option>
+            </select>
+            <input id="leg-shares" type="number" step="1" placeholder="±shares" aria-label="Signed shares">
+            <span id="leg-opt-fields" class="hidden">
+              <select id="leg-right" aria-label="Right"><option value="C">C</option><option value="P">P</option></select>
+              <input id="leg-expiry" maxlength="8" placeholder="yyyyMMdd" spellcheck="false" aria-label="Expiry">
+              <input id="leg-strike" type="number" step="0.5" placeholder="strike" aria-label="Strike">
+              <input id="leg-contracts" type="number" step="1" placeholder="±qty" aria-label="Signed contracts">
+            </span>
+            <button type="submit" class="btn btn-ghost small">Add</button>
+          </form>
+          <div class="hint muted small">β from adjusted daily closes (<code>gexctl load-closes</code>); solver deltas at the volblend surface, IBKR deltas as reference. Positions are yours — the dealer book above is not.</div>
+        </div>
+      </section>
+
       <!-- Snapshot Sweeper (GUI-controlled, max 2, cost-guarded) -->
       <section class="panel hidden" id="panel-sweeper">
         <div class="panel-head">

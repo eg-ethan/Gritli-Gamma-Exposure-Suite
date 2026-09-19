@@ -108,9 +108,9 @@ func (c *Core) ActiveTickers() []string {
 
 // VendorOIConfig drives the refresh loop.
 type VendorOIConfig struct {
-	BaseURL string         // defaults to oiquote.DefaultBaseURL
-	Every   time.Duration  // per-ticker refresh cadence (default 15m — OI is daily-grain)
-	Client  *http.Client   // defaults to a 30s-timeout client
+	BaseURL string        // defaults to oiquote.DefaultBaseURL
+	Every   time.Duration // per-ticker refresh cadence (default 15m — OI is daily-grain)
+	Client  *http.Client  // defaults to a 30s-timeout client
 	Log     func(string, ...any)
 }
 

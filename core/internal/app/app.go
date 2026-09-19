@@ -35,6 +35,7 @@ import (
 
 	"gexcore/internal/exposure"
 	"gexcore/internal/garch"
+	"gexcore/internal/hedge"
 	"gexcore/internal/market"
 	"gexcore/internal/store"
 )
@@ -51,8 +52,13 @@ type Config struct {
 	// LiveBlend enables the design-2 vol surface in every ticker engine
 	// (quoted-IV skew overlay on the GARCH/flat anchor; internal/volblend).
 	LiveBlend bool
-	Now       func() time.Time
-	Logger    func(string, ...any)
+	// Hedge pair seed (hedge module Phase 2, architecture.md §12): the asset
+	// must be a watchlist ticker; the benchmark is spot-only. A stored pair
+	// wins — the flags only seed a fresh database.
+	HedgeAsset string
+	HedgeBench string
+	Now        func() time.Time
+	Logger     func(string, ...any)
 }
 
 func (c Config) withDefaults() Config {
@@ -120,6 +126,22 @@ type Service struct {
 	// itself when the GUI connects/disconnects — with an edge feed owned by
 	// another process, stream switches alone change nothing on the wire.
 	feedGate func(on bool)
+
+	// hedge module state (Phase 2, architecture.md §12) — guarded by mu
+	hedgeAsset   string
+	hedgeBench   string
+	hedgeLegs    []hedge.Leg
+	hedgeNextID  int64 // in-memory ids only (DBPath == "")
+	hedgeStats   hedge.Stats
+	hedgeStatsOK bool
+	hedgeN       int    // shared closes for the INSUFFICIENT_HISTORY state
+	hedgeSession string // ET session key the stats were computed at
+	benchSpot    float64
+	benchSpotMs  int64
+	benchSeed    float64
+	hedgeCache   HedgeState
+	ibkrDeltas   map[int64]float64
+	ibkrAt       time.Time
 }
 
 // New opens the store (if configured), restores saved state for the watchlist
@@ -185,6 +207,27 @@ func New(cfg Config) (*Service, error) {
 		return nil, errors.New("app: empty watchlist")
 	}
 	s.active = s.order[0]
+
+	// hedge module boot: stored pair + legs; flags seed only a fresh database
+	if s.str != nil {
+		if a, b, ok, err := s.str.LoadHedgePair(); err != nil {
+			s.Close()
+			return nil, fmt.Errorf("app: load hedge pair: %w", err)
+		} else if ok {
+			s.hedgeAsset, s.hedgeBench = a, b
+		}
+		legs, err := s.str.Positions()
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("app: load positions: %w", err)
+		}
+		s.hedgeLegs = legs
+	}
+	if s.hedgeAsset == "" && cfg.HedgeAsset != "" {
+		if err := s.setHedgePairLocked(cfg.HedgeAsset, cfg.HedgeBench); err != nil {
+			s.cfg.Logger("app: hedge pair seed: %v", err) // non-fatal: the panel shows NO_PAIR
+		}
+	}
 	return s, nil
 }
 
@@ -443,6 +486,9 @@ func (s *Service) publish() {
 	}
 	if s.connectedLocked() && s.cfg.Now().Sub(s.lastPersist) > 30*time.Second {
 		s.saveStateLocked() // crash checkpoint; lastPersist stamps inside
+	}
+	if s.hedgeAsset != "" {
+		s.recomputeHedgeLocked() // cheap: stats cached per ET session
 	}
 	s.mu.Unlock()
 

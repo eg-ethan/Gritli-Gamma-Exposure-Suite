@@ -80,10 +80,10 @@ const (
 	AnomalyIVJump         = "iv_jump"         // quoted IV moved > 50% between updates
 	AnomalyUnknownCon     = "unknown_contract"
 	AnomalyUnknownTicker  = "unknown_ticker"
-	AnomalyChainReplace   = "chain_replace" // mid-session re-discovery of a chain
-	AnomalyApplyFailed    = "apply_failed"  // book rejected a flush
-	AnomalyWriteFailed    = "write_failed"  // computation-log write failed
-	AnomalyStaleEvent     = "stale_event"   // event older than the applied book state
+	AnomalyChainReplace   = "chain_replace"      // mid-session re-discovery of a chain
+	AnomalyApplyFailed    = "apply_failed"       // book rejected a flush
+	AnomalyWriteFailed    = "write_failed"       // computation-log write failed
+	AnomalyStaleEvent     = "stale_event"        // event older than the applied book state
 	AnomalyNamespace      = "namespace_overflow" // placeholder conId allocation left the ticker's namespace slot
 
 	AnomalyVendorOIEmpty = "vendor_oi_empty" // vendor OI refresh matched 0 contracts (mapping/universe drift)
@@ -98,7 +98,7 @@ func newDiagnostics(now func() time.Time) *Diagnostics {
 		now = time.Now
 	}
 	return &Diagnostics{
-		vendor: map[string]VendorOIStat{},
+		vendor:    map[string]VendorOIStat{},
 		startedAt: now(),
 		now:       now,
 		counters:  map[string]int64{},
@@ -206,22 +206,22 @@ type Latency struct {
 // Snapshot is the /api/diagnostics read model. Anomalies come newest-last,
 // capped to `last` entries (0 = all, up to the ring cap).
 type Snapshot struct {
-	StartedAtMs  int64            `json:"startedAtMs"`
-	UptimeMs     int64            `json:"uptimeMs"`
-	Sessions     int64            `json:"sessions"`
-	Events       int64            `json:"events"`
-	ByType       map[string]int64 `json:"byType"`
-	Malformed    int64            `json:"malformed"`
-	SeqGaps      int64            `json:"seqGaps"`
-	Applied      int64            `json:"applied"`
-	Rejected     int64            `json:"rejected"`
-	ApplyErrors  int64            `json:"applyErrors"`
-	WriteErrors  int64            `json:"writeErrors"`
-	LastEventMs  int64            `json:"lastEventMs,omitempty"`
-	LastSeq      int64            `json:"lastSeq"`
-	Latency      Latency          `json:"latency"`
-	Anomalies    []Anomaly        `json:"anomalies"`
-	VendorOI     map[string]VendorOIStat `json:"vendorOI,omitempty"`
+	StartedAtMs int64                   `json:"startedAtMs"`
+	UptimeMs    int64                   `json:"uptimeMs"`
+	Sessions    int64                   `json:"sessions"`
+	Events      int64                   `json:"events"`
+	ByType      map[string]int64        `json:"byType"`
+	Malformed   int64                   `json:"malformed"`
+	SeqGaps     int64                   `json:"seqGaps"`
+	Applied     int64                   `json:"applied"`
+	Rejected    int64                   `json:"rejected"`
+	ApplyErrors int64                   `json:"applyErrors"`
+	WriteErrors int64                   `json:"writeErrors"`
+	LastEventMs int64                   `json:"lastEventMs,omitempty"`
+	LastSeq     int64                   `json:"lastSeq"`
+	Latency     Latency                 `json:"latency"`
+	Anomalies   []Anomaly               `json:"anomalies"`
+	VendorOI    map[string]VendorOIStat `json:"vendorOI,omitempty"`
 }
 
 // Read returns the diagnostic snapshot (all retained anomalies).

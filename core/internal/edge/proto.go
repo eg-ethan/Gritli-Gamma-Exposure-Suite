@@ -40,7 +40,7 @@ type Envelope struct {
 	V    int             `json:"v"`
 	Seq  int64           `json:"seq"`
 	Type string          `json:"type"`
-	TS   int64           `json:"ts"` // epoch ms, sender-stamped
+	TS   int64           `json:"ts"`           // epoch ms, sender-stamped
 	ID   int64           `json:"id,omitempty"` // request correlation (chain → sub_set)
 	Data json.RawMessage `json:"data,omitempty"`
 }
@@ -57,6 +57,13 @@ const (
 	TypePing    = "ping"    // keepalive
 	TypePong    = "pong"    // keepalive reply
 	TypeBye     = "bye"     // clean disconnect notice
+
+	// TypeSpotSub announces a SPOT-ONLY ticker (the hedge module's benchmark,
+	// spec §3): the edge will stream L1 spot for it with NO chain — no
+	// reqSecDefOptParams, no sub_set, no sweeps, no OI rotation. The core
+	// registers it so its spot events apply without the unknown-ticker
+	// anomaly and with no chain ever expected. Additive in v1.
+	TypeSpotSub = "spot_sub"
 )
 
 // Core → edge messages (ControlPlane + handshake replies).
@@ -79,6 +86,10 @@ const (
 	// it changes and after every hello. Empty-on-hello is what makes a core
 	// restart stop a stale edge: nothing arms without the GUI's say-so.
 	TypeSweepSet = "sweep_set" // {tickers:[{ticker,intervalSeconds}]} — the whole roster
+
+	// TypeSpotAck replies to spot_sub: the registration landed. Correlated
+	// by Id like chain → sub_set. Additive in v1.
+	TypeSpotAck = "spot_ack"
 )
 
 // Hello is the edge's handshake payload.
@@ -99,7 +110,7 @@ type Welcome struct {
 // the trading class it lists under, and its settlement convention (SPX/SPXW
 // co-listed monthlies arrive as two entries with the same date).
 type ChainListing struct {
-	Date         string `json:"date"`         // yyyyMMdd
+	Date         string `json:"date"` // yyyyMMdd
 	TradingClass string `json:"tradingClass"`
 	Settlement   string `json:"settlement,omitempty"` // AM | PM | ""
 }
@@ -179,6 +190,19 @@ type OptComp struct {
 type SpotEvent struct {
 	Ticker string  `json:"ticker"`
 	Price  float64 `json:"price"`
+}
+
+// SpotSub announces a spot-only ticker (the hedge benchmark): L1 spot will
+// stream for Ticker with no chain discovery of any kind. There is no
+// undPrice fallback for such a ticker — a dead line means the core's
+// staleness gate takes over, by design.
+type SpotSub struct {
+	Ticker string `json:"ticker"`
+}
+
+// SpotAck confirms a spot_sub registration.
+type SpotAck struct {
+	Ticker string `json:"ticker"`
 }
 
 // TradeEvent is the TickTrade payload (with the quote at trade time — the

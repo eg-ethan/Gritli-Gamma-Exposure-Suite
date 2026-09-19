@@ -21,11 +21,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"gexcore/internal/app"
 	"gexcore/internal/edge"
+	"gexcore/internal/hedge"
 )
 
 //go:embed static
@@ -97,6 +99,10 @@ func NewServer(svc *app.Service) (*Server, error) {
 	mux.HandleFunc("POST /api/streams", s.handleStreams)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/diagnostics", s.handleDiagnostics)
+	mux.HandleFunc("GET /api/hedge", s.handleHedge)
+	mux.HandleFunc("POST /api/hedge-pair", s.handleHedgePairSet)
+	mux.HandleFunc("POST /api/positions", s.handlePositionAdd)
+	mux.HandleFunc("DELETE /api/positions/{id}", s.handlePositionDelete)
 	mux.HandleFunc("GET /api/sweeps", s.handleSweepsGet)
 	mux.HandleFunc("POST /api/sweeps", s.handleSweepsPost)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -114,6 +120,61 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.diagnostics())
+}
+
+// handleHedge renders the beta-weighted hedge read model (state machine,
+// β/ρ/N, spots, target shares, priced legs).
+func (s *Server) handleHedge(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.svc.Hedge())
+}
+
+// handleHedgePairSet: POST {"asset": "TSLA", "benchmark": "CIBR"} — the asset
+// must be a watchlist ticker (it needs a chain); the benchmark is spot-only.
+func (s *Server) handleHedgePairSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Asset     string `json:"asset"`
+		Benchmark string `json:"benchmark"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json body")
+		return
+	}
+	if err := s.svc.SetHedgePair(req.Asset, req.Benchmark); err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.svc.Hedge())
+}
+
+// handlePositionAdd: POST one leg — {"kind":"share","shares":100} or
+// {"kind":"option","right":"C","expiry":"20261218","strike":400,
+// "contracts":-3,"conId":0,"tradingClass":"","note":""}.
+func (s *Server) handlePositionAdd(w http.ResponseWriter, r *http.Request) {
+	var leg hedge.Leg
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&leg); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json body")
+		return
+	}
+	stored, err := s.svc.AddPosition(leg)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, stored)
+}
+
+// handlePositionDelete: DELETE /api/positions/{id}.
+func (s *Server) handlePositionDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad position id")
+		return
+	}
+	if err := s.svc.DeletePosition(id); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.svc.Hedge())
 }
 
 // handleSweepsGet renders the sweeper read model: per-ticker armed/sweeping/
@@ -175,9 +236,11 @@ func (s *Server) Handler() http.Handler { return s.guard(s.mux) }
 //
 //   - Host must name an allowed host, so a DNS-rebinding page cannot read
 //     or drive the API under its own origin.
-//   - State-changing requests must carry Content-Type: application/json,
-//     which a cross-site form or no-cors fetch cannot send without a CORS
-//     preflight (which this server never approves).
+//   - Body-carrying requests (POST/PUT/PATCH) must carry
+//     Content-Type: application/json, which a cross-site form or no-cors
+//     fetch cannot send without a CORS preflight (which this server never
+//     approves). Bodyless DELETE is safe without it — cross-site DELETE
+//     needs a preflight this server never grants.
 //   - A present Origin must also be an allowed host, rejecting cross-site
 //     requests outright.
 func (s *Server) guard(next http.Handler) http.Handler {
@@ -193,7 +256,8 @@ func (s *Server) guard(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch:
 			mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 			if err != nil || mt != "application/json" {
 				writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")

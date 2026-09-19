@@ -9,6 +9,7 @@
 //	gexctl serve      --db gex.db [--addr 127.0.0.1:8787] [--edge-addr …] [--edge-sim] [--journal …]
 //	gexctl replay     --journal session.jsonl [--db gex.db] [--json]
 //	gexctl fit-garch  --ticker SPX --returns closes.csv [--db gex.db] | --ticker SPY --from-arch arch.json
+//	gexctl load-closes --ticker PANW --closes PANW_closes.csv [--db gex.db] [--json]
 //
 // Every subcommand is routed end-to-end (feed → selection → solver → exposure
 // → output → persist); the full numeric pipeline is live.
@@ -27,6 +28,11 @@ import (
 	"strconv"
 	"text/tabwriter"
 	"time"
+
+	// embedded tz database: the hedge module's staleness gate and β-refresh
+	// need America/New_York, and time.LoadLocation fails on Windows and static
+	// Linux builds without it (stdlib-only — the dependency posture holds).
+	_ "time/tzdata"
 
 	"gexcore/internal/exposure"
 	"gexcore/internal/garch"
@@ -55,6 +61,8 @@ func main() {
 		err = cmdReplay(os.Args[2:])
 	case "fit-garch":
 		err = cmdFitGarch(os.Args[2:])
+	case "load-closes":
+		err = cmdLoadCloses(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -80,6 +88,7 @@ commands:
   serve                   run the GEX Suite GUI (web frontend + engine)
   replay                  re-feed a recorded edge-session journal (offline diagnosis)
   fit-garch               fit GJR-GARCH to a return series and persist it
+  load-closes             ingest adjusted daily closes into Daily_Closes (hedge beta input)
 
 run "gexctl <command> -h" for command flags.
 `)

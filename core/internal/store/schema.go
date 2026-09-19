@@ -11,7 +11,9 @@ package store
 //   - Current_Market_State carries vanna/charm (solver-computed Greeks drive the engine; IBKR Greeks cross-check later).
 //   - New: Open_Interest, GARCH_Parameters, GARCH_State, Diurnal_Seasonality
 //     (architecture.md §6), Exposure_Snapshots (persisted levels),
-//     Data_Points + Export_Cursors (permanent master data log → master CSV).
+//     Data_Points + Export_Cursors (permanent master data log → master CSV),
+//     Daily_Closes (v6 — hedge module's beta regression input),
+//     Positions + Hedge_Pair (v7 — hedge module's manual portfolio + pair).
 //
 // All timestamps are Unix epoch milliseconds (INTEGER), stamped at receipt.
 
@@ -190,6 +192,42 @@ CREATE INDEX IF NOT EXISTS idx_data_points_time ON Data_Points (Timestamp);
 CREATE TABLE IF NOT EXISTS Export_Cursors (
     Name       TEXT PRIMARY KEY,
     Last_Id    INTEGER NOT NULL DEFAULT 0,
+    Updated_At INTEGER NOT NULL
+);
+
+-- New table (v6): daily closes for the hedge module's beta regression
+-- (architecture.md §12.5). VENDOR SPLIT/DIVIDEND-ADJUSTED values only — a
+-- raw close with a split inside the 252-day window silently corrupts the
+-- covariance; the loader enforces the ±35% return tripwire before persisting.
+CREATE TABLE IF NOT EXISTS Daily_Closes (
+    Ticker TEXT NOT NULL,
+    Date   TEXT NOT NULL,  -- yyyyMMdd
+    Close  REAL NOT NULL,
+    PRIMARY KEY (Ticker, Date)
+);
+
+-- New tables (v7): hedge module Phase 2 — the manually entered portfolio
+-- (architecture.md §12: Δ_net is the USER's positions, not the dealer book)
+-- and the hedge pair configuration (asset = chain ticker, benchmark =
+-- spot-only). Option legs resolve against the chain by Con_Id when known,
+-- else by (class, expiry, right, strike); unresolved is a flagged state.
+CREATE TABLE IF NOT EXISTS Positions (
+    Id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    Kind          TEXT NOT NULL CHECK (Kind IN ('share','option')),
+    Shares        REAL NOT NULL DEFAULT 0,   -- signed, share legs
+    Con_Id        INTEGER,                   -- resolved chain contract (option legs)
+    Trading_Class TEXT NOT NULL DEFAULT '',
+    Expiry        TEXT NOT NULL DEFAULT '',  -- yyyyMMdd
+    Right         TEXT NOT NULL DEFAULT '',  -- 'C' | 'P'
+    Strike        REAL NOT NULL DEFAULT 0,
+    Contracts     REAL NOT NULL DEFAULT 0,   -- signed, option legs
+    Note          TEXT NOT NULL DEFAULT '',
+    Updated_At    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS Hedge_Pair (
+    Id         INTEGER PRIMARY KEY CHECK (Id = 1), -- single row
+    Asset      TEXT NOT NULL,
+    Benchmark  TEXT NOT NULL,
     Updated_At INTEGER NOT NULL
 );
 `

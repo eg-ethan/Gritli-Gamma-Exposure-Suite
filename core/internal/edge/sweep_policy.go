@@ -37,14 +37,14 @@ import (
 // chain; 15s is pacing-bound back-to-back — $4.80/hr is a FLOOR, hence the
 // red banner.
 const (
-	SweepMaxTickers         = 2                    // GUI roster cap; edge clamps independently
-	SweepDefaultSeconds     = 60                   // "every 60s"
-	SweepFastSeconds        = 15                   // "every 15s" (cost floor)
-	SweepCostPerHour        = 1.20                 // 60s ticker, metered
-	SweepFastCostPerHourMin = 4.80                 // 15s ticker, metered MINIMUM
-	SweepMonitorEvery       = 20 * time.Second     // core sticky-shutoff cadence
-	SweepEdgeMonitorEvery   = 30 * time.Second     // edge window-monitor cadence (mirrored in C#)
-	MasterLogFlushEvery     = 30 * time.Minute     // master CSV cadence, wall-clock aligned :00/:30
+	SweepMaxTickers         = 2                // GUI roster cap; edge clamps independently
+	SweepDefaultSeconds     = 60               // "every 60s"
+	SweepFastSeconds        = 15               // "every 15s" (cost floor)
+	SweepCostPerHour        = 1.20             // 60s ticker, metered
+	SweepFastCostPerHourMin = 4.80             // 15s ticker, metered MINIMUM
+	SweepMonitorEvery       = 20 * time.Second // core sticky-shutoff cadence
+	SweepEdgeMonitorEvery   = 30 * time.Second // edge window-monitor cadence (mirrored in C#)
+	MasterLogFlushEvery     = 30 * time.Minute // master CSV cadence, wall-clock aligned :00/:30
 )
 
 // SweepWindowTickers are the index tickers with the tighter session window
@@ -245,10 +245,10 @@ type SweepInterval struct {
 // SweepRow is one watchlist ticker's sweep state.
 type SweepRow struct {
 	Ticker          string `json:"ticker"`
-	Armed           bool   `json:"armed"`     // in the core's roster
+	Armed           bool   `json:"armed"` // in the core's roster
 	IntervalSeconds int    `json:"intervalSeconds,omitempty"`
-	Sweeping        bool   `json:"sweeping"`  // the edge heartbeat says a loop is live
-	Allowed         bool   `json:"allowed"`   // window open right now
+	Sweeping        bool   `json:"sweeping"`         // the edge heartbeat says a loop is live
+	Allowed         bool   `json:"allowed"`          // window open right now
 	Reason          string `json:"reason,omitempty"` // why not (blocked rows)
 	OpensAtMs       int64  `json:"opensAtMs,omitempty"`
 }

@@ -178,3 +178,15 @@ func (e *Engine) Snapshot() (market.Snapshot, bool) {
 
 // Stop halts Run's loops (idempotent; ctx cancel works equally well).
 func (e *Engine) Stop() { e.stopOnce.Do(func() { close(e.stop) }) }
+
+// PricingInputs returns the engine's live pricing configuration — the book's
+// current chain + spot, the vol anchor, R/Q, and the blend flag — so
+// cross-cutting consumers (the hedge module's per-leg deltas) price through
+// the IDENTICAL pipeline the engine uses, with no duplicated wiring to drift.
+func (e *Engine) PricingInputs() (chain market.ChainSnapshot, spot float64, sigma TermStructure, r, q float64, blend bool, asOf time.Time, ok bool) {
+	bs, has := e.book.Latest(e.cfg.Ticker)
+	if !has {
+		return market.ChainSnapshot{}, 0, e.sigma, e.cfg.R, e.cfg.Q, e.cfg.BlendIVs, e.now(), false
+	}
+	return bs.Chain, bs.Spot, e.sigma, e.cfg.R, e.cfg.Q, e.cfg.BlendIVs, e.now(), true
+}

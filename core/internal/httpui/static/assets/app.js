@@ -1252,6 +1252,134 @@ async function pollDiagnostics() {
 setInterval(pollDiagnostics, 2000);
 pollDiagnostics();
 
+/* ── Beta-weighted hedge panel (hedge module Phase 2) ─────────────────
+   Polls /api/hedge every 2s. The state badge carries the machine's verdict
+   (ok / insufficient_history / stale_feed / …) — the reason line explains
+   it; STALE_FEED keeps the last target, grayed, never zeroed. */
+S.hedge = null;
+const HEDGE_STATE_LABEL = {
+  ok: "OK", no_pair: "no pair", no_positions: "no positions",
+  insufficient_history: "insufficient history", no_beta: "no beta",
+  no_asset_feed: "no asset feed", no_bench_feed: "no bench feed",
+  stale_feed: "STALE FEED",
+};
+async function pollHedge() {
+  let h;
+  try {
+    const r = await fetch("/api/hedge");
+    if (!r.ok) return;
+    h = await r.json();
+  } catch { return; }
+  S.hedge = h;
+  renderHedge();
+}
+function renderHedge() {
+  const h = S.hedge;
+  if (!h) return;
+  const stale = h.state === "stale_feed";
+  const okish = h.state === "ok" || stale; // a target exists in both
+
+  setText($("hedge-state-badge"), HEDGE_STATE_LABEL[h.state] || h.state);
+  $("hedge-state-badge").className = "muted small " +
+    (h.state === "ok" ? "pos" : stale || h.state === "insufficient_history" ? "neg" : "");
+
+  // pair form: watchlist tickers as asset options; keep the current selection
+  const sel = $("hedge-asset");
+  const watch = (S.watch || S.st?.watchlist || []).map((w) => w.ticker);
+  const sig = watch.join(",");
+  if (sel.dataset.sig !== sig) {
+    sel.dataset.sig = sig;
+    sel.innerHTML = watch.map((t) => `<option value="${t}">${t}</option>`).join("") || `<option value="">—</option>`;
+  }
+  if (h.asset && watch.includes(h.asset)) sel.value = h.asset;
+  if (!$("hedge-bench").value && h.benchmark) $("hedge-bench").value = h.benchmark;
+  setText($("hedge-pair-label"), h.asset ? `${h.asset} / ${h.benchmark}` : "pair");
+
+  setText($("hedge-beta"), h.beta ? h.beta.toFixed(3) : "—");
+  setText($("hedge-rho"), h.rho ? h.rho.toFixed(3) : "—");
+  const nLabel = h.n ? `${h.n}${h.n < 200 ? " (<200!)" : ""}` : "—";
+  setText($("hedge-n"), nLabel);
+  setText($("hedge-vols"), h.volA ? `${(100 * h.volA).toFixed(0)}% / ${(100 * (h.volB || 0)).toFixed(0)}%` : "—");
+
+  const sharesEl = $("hedge-shares");
+  sharesEl.textContent = okish && h.targetShares != null ? (h.targetShares > 0 ? "+" : "") + fmtNum(h.targetShares) : "—";
+  sharesEl.classList.toggle("neg", okish && h.targetShares < 0);
+  sharesEl.style.opacity = stale ? ".45" : "";
+  setText($("hedge-notional"), okish && h.hedgeValue ? fmtMoney(Math.abs(h.hedgeValue)) : "—");
+  setText($("hedge-dollar"), okish && h.dollarDelta ? fmtMoney(Math.abs(h.dollarDelta)) : "—");
+  setText($("hedge-net"), h.legs && h.legs.length ? fmtNum(h.netDelta) : "—");
+  setText($("hedge-spots"), h.assetSpot ? `${fmtMoney(h.assetSpot)} / ${fmtMoney(h.benchSpot)}` : "—");
+
+  const reasonEl = $("hedge-reason");
+  reasonEl.classList.toggle("hidden", !h.reason);
+  setText(reasonEl, h.reason || "");
+
+  const box = $("hedge-legs");
+  const legs = h.legs || [];
+  if (!legs.length) {
+    box.innerHTML = `<div class="muted small">No positions — add legs below.</div>`;
+  } else {
+    box.innerHTML = legs.map((l) => {
+      const d = l.kind === "option"
+        ? (l.resolved ? `${l.delta.toFixed(3)}${l.ibkrDelta ? ` <span class="muted">(${l.ibkrDelta.toFixed(2)} ibkr)</span>` : ""}` : `<span class="neg">unresolved</span>`)
+        : "—";
+      return `<div class="hedge-leg">` +
+        `<span class="hedge-leg-label" title="${l.note || ""}">${escapeHTML(legLabelOf(l))}</span>` +
+        `<span class="muted small">${d}</span>` +
+        `<span class="small">${l.shareEquiv > 0 ? "+" : ""}${fmtNum(l.shareEquiv)} Δ</span>` +
+        `<button type="button" class="btn btn-ghost small" data-leg-del="${l.id}">✕</button>` +
+        `</div>`;
+    }).join("");
+  }
+}
+function legLabelOf(l) {
+  if (l.kind === "share") return `${l.shares > 0 ? "+" : ""}${l.shares} shares`;
+  return `${l.contracts > 0 ? "+" : ""}${l.contracts} × ${l.strike} ${l.right} ${l.expiry}`;
+}
+function escapeHTML(s) { return String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`); }
+
+$("hedge-pair-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const r = await fetch("/api/hedge-pair", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ asset: $("hedge-asset").value, benchmark: $("hedge-bench").value.trim().toUpperCase() }),
+  });
+  if (!r.ok) { const e2 = await r.json(); alert(e2.error || "pair rejected"); return; }
+  S.hedge = await r.json();
+  renderHedge();
+});
+$("leg-kind").addEventListener("change", () => {
+  $("leg-opt-fields").classList.toggle("hidden", $("leg-kind").value !== "option");
+});
+$("hedge-leg-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const kind = $("leg-kind").value;
+  const leg = { kind };
+  if (kind === "share") {
+    leg.shares = parseFloat($("leg-shares").value);
+  } else {
+    leg.right = $("leg-right").value;
+    leg.expiry = $("leg-expiry").value.trim();
+    leg.strike = parseFloat($("leg-strike").value);
+    leg.contracts = parseFloat($("leg-contracts").value);
+  }
+  const r = await fetch("/api/positions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(leg),
+  });
+  if (!r.ok) { const e2 = await r.json(); alert(e2.error || "leg rejected"); return; }
+  if (kind === "share") $("leg-shares").value = ""; else { $("leg-expiry").value = ""; $("leg-strike").value = ""; $("leg-contracts").value = ""; }
+  pollHedge();
+});
+$("hedge-legs").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-leg-del]");
+  if (!b) return;
+  const r = await fetch(`/api/positions/${b.dataset.legDel}`, { method: "DELETE" });
+  if (!r.ok) { const e2 = await r.json(); alert(e2.error || "delete failed"); }
+  pollHedge();
+});
+setInterval(pollHedge, 2000);
+pollHedge();
+
 /* ── Snapshot sweeper (GUI-controlled, max 2, cost-guarded) ───────────
    Everything renders from GET /api/sweeps (knobs live in the core's
    sweep_policy.go — intervals, costs, cap, windows). Sweeps never start on

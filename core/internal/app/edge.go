@@ -66,7 +66,10 @@ func (s *Service) ApplyChain(ctx context.Context, snap market.ChainSnapshot) err
 	return nil
 }
 
-// ApplySpot routes an underlying tick into its ticker's book.
+// ApplySpot routes an underlying tick into its ticker's book. A tick for the
+// hedge benchmark (a spot_sub-registered ticker with no handle — Phase 3)
+// feeds the bench spot directly: this is the edge's real L1 line replacing
+// the simulator's fabricated walk.
 func (s *Service) ApplySpot(ctx context.Context, ticker string, spot float64, asOfMs int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -76,6 +79,12 @@ func (s *Service) ApplySpot(ctx context.Context, ticker string, spot float64, as
 	ticker = strings.ToUpper(ticker)
 	h := s.handles[ticker]
 	if h == nil {
+		if ticker == s.hedgeBench && spot > 0 {
+			s.benchSpot, s.benchSpotMs = spot, asOfMs
+			s.updates++
+			s.lastUpdate = s.cfg.Now()
+			return nil
+		}
 		return fmt.Errorf("app: edge spot for unknown ticker %q", ticker)
 	}
 	if err := h.book.ApplySpot(ctx, ticker, spot, asOfMs); err != nil {
@@ -84,6 +93,14 @@ func (s *Service) ApplySpot(ctx context.Context, ticker string, spot float64, as
 	s.updates++
 	s.lastUpdate = s.cfg.Now()
 	return nil
+}
+
+// GuessTickerSeed exposes the deterministic pseudo spot/vol the free slot
+// and the simulator fabricate for an unknown symbol (serve wires it into the
+// edge simulator's spot-only benchmark entry).
+func GuessTickerSeed(ticker string) (spot, vol float64) {
+	e := guessTicker(ticker)
+	return e.Spot, e.Vol
 }
 
 // BaselineIV answers the 2SD-filter IV the edge core needs when a chain

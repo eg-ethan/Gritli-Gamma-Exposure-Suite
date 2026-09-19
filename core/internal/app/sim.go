@@ -70,6 +70,19 @@ func (s *Service) simulate(ctx context.Context) {
 		s.mu.Lock()
 		s.updates++
 		s.lastUpdate = s.cfg.Now()
+		// spot-only benchmark walk (no handle, no chain): the hedge module's
+		// Phase-2 stand-in — the edge's L1 line replaces it in Phase 3
+		if underlying && s.hedgeBench != "" && s.handles[s.hedgeBench] == nil {
+			if s.benchSeed == 0 {
+				s.benchSeed = guessTicker(s.hedgeBench).Spot
+			}
+			prev := s.benchSpot
+			if prev == 0 {
+				prev = s.benchSeed
+			}
+			s.benchSpot = s.walkSpot(prev, s.benchSeed)
+			s.benchSpotMs = s.cfg.Now().UnixMilli()
+		}
 		s.mu.Unlock()
 	}
 }

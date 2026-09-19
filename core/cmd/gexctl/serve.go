@@ -57,12 +57,16 @@ func cmdServe(args []string) error {
 	oiVendor := fs.String("oi-vendor", "cboe", "vendor open-interest source for TWS accounts whose feed delivers no option OI — patches CBOE delayed OI onto live books (\"cboe\" or \"none\")")
 	masterCsv := fs.String("master-csv", "", "master data CSV every collected data point appends to every 30 min (empty = master_data.csv next to the DB; no DB = off)")
 	allowHosts := fs.String("allow-host", "", "comma-separated extra hostnames/IPs the GUI accepts in Host/Origin headers (localhost is always allowed; the API still has no auth)")
+	hedgeAsset := fs.String("hedge-asset", "", "hedge module asset — must be a watchlist ticker (needs a chain); seeds the pair, a stored pair wins")
+	hedgeBench := fs.String("hedge-bench", "", "hedge module benchmark — spot-only ticker (ETF-preferred); seeds the pair, a stored pair wins")
 	fs.Parse(args)
 
 	svc, err := app.New(app.Config{
 		Custom: strings.ToUpper(*custom),
 		Seed:   seed, DBPath: *dbPath,
-		LiveBlend: true,
+		LiveBlend:  true,
+		HedgeAsset: strings.ToUpper(*hedgeAsset),
+		HedgeBench: strings.ToUpper(*hedgeBench),
 	})
 	if err != nil {
 		return err
@@ -155,11 +159,20 @@ func cmdServe(args []string) error {
 	if *edgeSim && stack != nil {
 		go func() {
 			tickers := make([]edge.SimTicker, 0, 9)
+			watched := map[string]bool{}
 			for _, e := range svc.Watchlist() {
 				tickers = append(tickers, edge.SimTicker{Ticker: e.Ticker, Spot: e.Spot, Vol: e.Vol})
+				watched[e.Ticker] = true
+			}
+			// the hedge benchmark rides the real Phase-3 wire path when it is
+			// not itself a watchlist ticker: spot_sub, then L1 spot only
+			var spotOnly []edge.SimTicker
+			if h := svc.Hedge(); h.Benchmark != "" && !watched[h.Benchmark] {
+				seedSpot, _ := app.GuessTickerSeed(h.Benchmark)
+				spotOnly = append(spotOnly, edge.SimTicker{Ticker: h.Benchmark, Spot: seedSpot})
 			}
 			res, err := edge.RunSim(ctx, edge.SimConfig{
-				Addr: stack.srv.Addr().String(), Tickers: tickers,
+				Addr: stack.srv.Addr().String(), Tickers: tickers, SpotOnly: spotOnly,
 				Interval: 250 * time.Millisecond, Seed: seed, Scenarios: true,
 			})
 			if err != nil {

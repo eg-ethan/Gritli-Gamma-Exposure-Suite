@@ -33,9 +33,9 @@ const DefaultBaseURL = "https://cdn.cboe.com/api/global/delayed_quotes/options"
 // Entry is one contract's vendor OI, keyed the same way the ingest working
 // chain keys contracts.
 type Entry struct {
-	Class  string  // OCC root == IBKR trading class (SPX, SPXW, TSLA, …)
-	Expiry string  // yyyyMMdd
-	Right  string  // "C" | "P"
+	Class  string // OCC root == IBKR trading class (SPX, SPXW, TSLA, …)
+	Expiry string // yyyyMMdd
+	Right  string // "C" | "P"
 	Strike float64
 	OI     float64
 }
@@ -118,9 +118,9 @@ func Fetch(ctx context.Context, hc *http.Client, baseURL, ticker string) (Quote,
 		// the feed has shipped timestamp as both a JSON number and a string
 		// ("1788977000") across the years — accept either
 		Timestamp json.RawMessage `json:"timestamp"`
-		Data struct {
+		Data      struct {
 			CurrentPrice float64 `json:"current_price"`
-			Options []struct {
+			Options      []struct {
 				Option       string  `json:"option"`
 				OpenInterest float64 `json:"open_interest"`
 			} `json:"options"`

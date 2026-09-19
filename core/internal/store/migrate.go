@@ -130,5 +130,43 @@ func migrate(db *sql.DB) error {
 		}
 		log.Printf("store: migrated: deleted %d out-of-namespace synthetic conId rows (rewritten on next discovery)", len(foreign))
 	}
+
+	// v6: hedge module — daily closes for the beta regression
+	// (architecture.md §12.5). A whole new table, so the idempotent CREATE is
+	// the entire migration; no ALTER, no backfill.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS Daily_Closes (
+		Ticker TEXT NOT NULL,
+		Date   TEXT NOT NULL,
+		Close  REAL NOT NULL,
+		PRIMARY KEY (Ticker, Date)
+	)`); err != nil {
+		return fmt.Errorf("create Daily_Closes: %w", err)
+	}
+
+	// v7: hedge module Phase 2 — manual portfolio positions + the hedge pair
+	// (architecture.md §12). Whole new tables; idempotent CREATEs.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS Positions (
+		Id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		Kind          TEXT NOT NULL CHECK (Kind IN ('share','option')),
+		Shares        REAL NOT NULL DEFAULT 0,
+		Con_Id        INTEGER,
+		Trading_Class TEXT NOT NULL DEFAULT '',
+		Expiry        TEXT NOT NULL DEFAULT '',
+		Right         TEXT NOT NULL DEFAULT '',
+		Strike        REAL NOT NULL DEFAULT 0,
+		Contracts     REAL NOT NULL DEFAULT 0,
+		Note          TEXT NOT NULL DEFAULT '',
+		Updated_At    INTEGER NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create Positions: %w", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS Hedge_Pair (
+		Id         INTEGER PRIMARY KEY CHECK (Id = 1),
+		Asset      TEXT NOT NULL,
+		Benchmark  TEXT NOT NULL,
+		Updated_At INTEGER NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create Hedge_Pair: %w", err)
+	}
 	return nil
 }
