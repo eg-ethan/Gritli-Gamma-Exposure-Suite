@@ -40,9 +40,13 @@ With a vol for each contract, the solver prices Greeks using the Bjerksund-Stens
 
 Results go to SQLite, which the core alone owns. On restart it reloads the last saved book, so the charts can be viewed with no feed connected.
 
+## Hedging your own book
+
+Separate from the market-wide dealer exposure above, the **Beta Hedge** panel sizes a hedge for the positions you enter yourself: signed shares and option legs on one asset, beta-weighted onto one benchmark ETF. β is raw OLS over a 252-session trailing window of adjusted daily closes, loaded with `gexctl load-closes` (a ±35% plausibility tripwire rejects split-contaminated files by date, and a re-adjusted vendor history must be re-loaded whole with `--replace`). Option legs price at the same volblend surface the engine uses, with IBKR's model delta shown alongside as a reference. The benchmark's spot is the edge's real L1 line — the C# edge's `--hedge-bench` flag holds one permanent spot-only subscription for it, and `gexctl serve --edge-sim` announces it the same way. The output is a target benchmark share count — never an order — and every failure mode (insufficient history with the session count shown, a stale spot during regular hours with the last target kept and grayed, an unresolved leg) is an explicit state rather than a zero. The panel and its flags are documented in `core/README-GUI.md`; the decision record is `architecture.md` §12.
+
 ## Checking the math
 
-A pricing bug in this pipeline wouldn't crash anything. It would just move a wall to the wrong strike. So the core is pinned to independent references. Python scripts in `docs/_verify/` generate golden values for GARCH and a full GEX book, and the Go tests must match them within 1e-8 relative on totals. The root finder is fuzz-tested against bisection, and the GARCH fitter has to recover known parameters from 8,000 simulated returns. `docs/_verify/edge_protocol_conformance.py` is a third client, written separately in Python, that checks the edge protocol against a running core.
+A pricing bug in this pipeline wouldn't crash anything. It would just move a wall to the wrong strike. So the core is pinned to independent references. Python scripts in `docs/_verify/` generate golden values for GARCH, a full GEX book, and the hedge β/ρ chain, and the Go tests must match them within 1e-8 relative on totals. The root finder is fuzz-tested against bisection, the GARCH fitter has to recover known parameters from 8,000 simulated returns, and the OLS beta has to recover a constructed coefficient exactly. `docs/_verify/edge_protocol_conformance.py` is a third client, written separately in Python, that checks the edge protocol against a running core.
 
 The equations behind the solver and exposure engine are in `docs/equations.md`, and `architecture.md` records each design decision in the order it was made, including where the build moved away from the first plan.
 
@@ -100,6 +104,8 @@ The HTTP API and the edge port have no authentication, so both bind to localhost
 | `core/internal/solver` | Bjerksund-Stensland 2002 Greeks |
 | `core/internal/exposure` | per-contract GEX, walls, flip, per-class aggregation |
 | `core/internal/rootfind` | Brent root finder |
+| `core/internal/hedge` | beta-weighted hedging: adjusted-closes stats (β/ρ), the ±35% tripwire, positions, target sizing |
+| `core/internal/oiquote` | CBOE delayed-quotes vendor open-interest fetch |
 | `core/internal/store` | SQLite schema and migrations, and the boot reload |
 | `core/internal/httpui` | embedded web GUI and JSON/SSE API |
 | `ops/` | nightly GARCH fit script |

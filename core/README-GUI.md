@@ -29,6 +29,12 @@ Then open **http://127.0.0.1:8787** in any browser.
 | `--ticker` | *(empty)* | seed for the free watchlist slot (e.g. `--ticker AAPL`) |
 | `--connect` | off | connect the data streams immediately at startup |
 | `--seed` | `42` | simulator RNG seed (chain layout is seed-stable per day) |
+| `--edge-addr` | *(off)* | listen address for the edge ingest protocol — the C# edge service connects here |
+| `--edge-sim` | off | connect the built-in deterministic edge simulator to `--edge-addr` (no TWS needed); implies `--connect` |
+| `--journal FILE` | *(off)* | record the edge session as JSONL for later `gexctl replay` |
+| `--oi-vendor` | `cboe` | vendor open-interest source for TWS accounts whose feed delivers no option OI (`cboe` or `none`) |
+| `--hedge-asset` | *(off)* | hedge module asset — must be a watchlist ticker (it needs a chain); seeds the pair, a stored pair wins |
+| `--hedge-bench` | *(off)* | hedge module benchmark — spot-only ticker (ETF-preferred); seeds the pair, a stored pair wins |
 
 ## Watchlist
 
@@ -58,8 +64,8 @@ above the line, puts below). The stat tiles read:
 - **Term Slope** — front-month ATM IV minus the next expiry's.
 
 Deltas are priced at each contract's own quoted IV (BS2002), while exposure
-numbers keep the GARCH sigma-bar anchor — by design. In
-production the quoted IVs come from EdgeStream `OptionComputation.impliedVol`;
+numbers keep the GARCH sigma-bar anchor — by design. Live quoted IVs arrive
+on the edge protocol's `optcomp` events (`impliedVol` field);
 the synthetic feed shapes a realistic equity smile, and chain CSVs can carry
 an `iv` column.
 
@@ -68,9 +74,10 @@ an `iv` column.
 - The app boots **disconnected** in **SNAPSHOT** mode: it renders the last
   saved state from the DB. On a brand-new DB the panels are empty until the
   first session.
-- Press **Connect** to start the live data stream. In this build the stream is
-  the documented synthetic simulator (the stand-in for the IBKR C# edge
-  service); the GEX bar chart, the expiration heatmap, the gamma price
+- Press **Connect** to start the data stream — the built-in synthetic
+  simulator by default, or the real C# edge feed when `serve` runs with
+  `--edge-addr` (`--edge-sim` connects the protocol-exact stand-in, no TWS
+  needed); the GEX bar chart, the expiration heatmap, the gamma price
   profile and the ΔGEX history all update live.
 - The two per-stream switches under **Data Streams** control the underlying
   tick feed and the option-chain/OI feed independently.
@@ -90,6 +97,12 @@ an `iv` column.
   expiries, red = put-heavy, green = call-heavy, spot row marked).
 - **Open Interest** tab — call/put OI by strike (the dealer-inventory
   baseline that drives GEX).
+- **Exposure by Settlement Class** strip — per-class totals/walls for index
+  tickers with AM/PM co-listings (SPX monthlies vs SPXW weeklies), rendered
+  only when `Snapshot.Classes` is non-empty.
+- **Ingest Diagnostics** panel (edge mode) — event counters, sequence-gap
+  and anomaly ring, vendor-OI match counts, polled from `/api/diagnostics`.
+- **Beta Hedge** panel (right rail) — see below.
 - Right rail — stream controls, **Intraday ΔGEX**, heuristic signals and the
   gamma-squeeze probability score.
 
@@ -102,6 +115,40 @@ reaches back that far (rows appear as the session ages). The Gamma Price
 Profile additionally brackets the sharp negative→positive gamma crossing with
 two 50 %-opacity dashed verticals — the **gamma auction** zone where dealer
 hedging flips direction.
+
+## Beta Hedge
+
+The **Beta Hedge** panel sizes a beta-weighted hedge for **your own
+portfolio** — the manual positions you enter there — never the market-wide
+dealer book the rest of the dashboard computes. The pair form picks a hedge
+asset (any watchlist ticker; solver Greeks need its chain) and a benchmark
+(any symbol, ETF-preferred; spot-only). Legs are added below: signed shares,
+or signed option contracts by expiry/strike/right — option legs price at the
+same volblend→BS2002 surface the engine uses, with IBKR's model delta shown
+as the reference and unresolved legs flagged instead of failing.
+
+The target is `Q = −round(β·Δ_net·S_asset / S_bench)` — a long book hedges
+SHORT in the benchmark. β is raw OLS over a 252-session trailing window of
+**adjusted** daily closes, which must be loaded first:
+
+```bash
+gexctl load-closes --ticker TSLA --closes TSLA_closes.csv --db gex.db
+gexctl load-closes --ticker CIBR --closes CIBR_closes.csv --db gex.db
+```
+
+The state badge carries the machine's verdict, and every failure is explicit
+rather than a zero: `insufficient history` (N < 200 overlapping sessions,
+with the count shown), `no positions`, `no bench feed`, and `STALE FEED`
+(spot older than 60 s during US regular hours — the last target is kept,
+grayed, never zeroed). β, ρ, N and both annualized vols are always shown
+when computable so hedge quality is visible at a glance; a low ρ means
+basis risk no target size can fix. The pair persists across restarts
+(`--hedge-asset/--hedge-bench` only seed a fresh database), and so do the
+positions. The benchmark spot is the edge's real L1 line (Phase 3 landed):
+run the C# edge with `--hedge-bench SYM` (or `gexctl serve --edge-sim`,
+whose simulator announces the stored pair's benchmark itself) — one
+permanent spot-only line, no chain. A running edge does not learn a NEW
+benchmark from a GUI pair change: restart it with the new `--hedge-bench`.
 
 ## Layout
 
@@ -121,14 +168,17 @@ Resize the window freely; charts redraw at device-pixel resolution.
 - **Windows:** SmartScreen may warn on first run of an unsigned binary —
   More info → Run anyway.
 
-## Data source today vs. production
+## Data source: simulator vs. live edge
 
-The architecture (architecture.md) puts an IBKR-facing C# edge service in
-front of this core over localhost gRPC. Until that lands, `serve` feeds the
-engine with a deterministic synthetic chain + random-walk spot through the
-same `market.Feed` seam the real adapter will use. Every number the GUI shows
-is computed by the production pipeline: Bjerksund-Stensland 2002 Greeks at
-the vol anchor, dealer-inventory OI convention, per-contract dollar GEX,
-walls, and the Brent-refined zero-gamma flip.
+The IBKR-facing C# edge service (`edge/`) is built and live-proven; it feeds
+this core over versioned JSON-lines on localhost TCP (`--edge-addr` — the
+boundary delivered in place of the gRPC originally sketched; architecture.md
+§10.2). Without it, `serve` drives the identical pipeline with a
+deterministic synthetic chain + random-walk spot through the same
+`market.Feed` seam, and `--edge-sim` runs the protocol-exact stand-in. Every
+number the GUI shows is computed by the production pipeline:
+Bjerksund-Stensland 2002 Greeks at the volblend anchor, dealer-inventory OI
+convention, per-contract dollar GEX, walls, and the Brent-refined zero-gamma
+flip.
 
 *Not investment advice.*
