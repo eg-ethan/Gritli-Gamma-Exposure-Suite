@@ -31,6 +31,7 @@ public static class Program
         var oiLines = 40;
         var oiHoldSeconds = 30;
         var noSweep = false;
+        var hedgeBench = "";
         var instance = Environment.MachineName + "-gex-edge";
 
         for (var i = 0; i < args.Length; i++)
@@ -49,6 +50,7 @@ public static class Program
                 case "--oi-lines": oiLines = int.Parse(args[++i]); break;
                 case "--oi-hold-seconds": oiHoldSeconds = int.Parse(args[++i]); break;
                 case "--no-sweep": noSweep = true; break; // zero snapshot spend: rotation-only
+                case "--hedge-bench": hedgeBench = args[++i].Trim().ToUpperInvariant(); break; // spot-only benchmark: one L1 line, no chain
                 case "--instance": instance = args[++i]; break;
                 default:
                     Console.Error.WriteLine($"gex-edge: unknown flag {args[i]}");
@@ -73,7 +75,9 @@ public static class Program
                 if (simulate)
                 {
                     var tickers = Tickers.Select(t => (t, IndexPrimitives.SeedSpot(t), 0.20)).ToList();
-                    await new SimulatedFeed(conn, tickers, TimeSpan.FromMilliseconds(intervalMs), seed).RunAsync(cts.Token);
+                    (string ticker, double spot)? bench =
+                        string.IsNullOrEmpty(hedgeBench) ? null : (hedgeBench, IndexPrimitives.SeedSpot(hedgeBench));
+                    await new SimulatedFeed(conn, tickers, TimeSpan.FromMilliseconds(intervalMs), seed, bench).RunAsync(cts.Token);
                 }
                 else
                 {
@@ -88,6 +92,7 @@ public static class Program
                         OiLines = oiLines,
                         OiHoldSeconds = oiHoldSeconds,
                         NoSweep = noSweep,
+                        HedgeBench = string.IsNullOrEmpty(hedgeBench) ? null : hedgeBench,
                     };
                     // GUI Disconnect/Connect now reaches the edge: pause
                     // tears the TWS session down (no snapshot spend while

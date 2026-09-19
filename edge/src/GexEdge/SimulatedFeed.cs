@@ -17,13 +17,16 @@ public sealed class SimulatedFeed
     private readonly IReadOnlyList<(string ticker, double spot, double vol)> _tickers;
     private readonly TimeSpan _interval;
     private readonly Random _rng;
+    private readonly (string ticker, double spot)? _bench; // spot-only benchmark (Phase 3)
 
-    public SimulatedFeed(CoreConnection core, IReadOnlyList<(string, double, double)> tickers, TimeSpan interval, int seed)
+    public SimulatedFeed(CoreConnection core, IReadOnlyList<(string, double, double)> tickers, TimeSpan interval, int seed,
+        (string ticker, double spot)? bench = null)
     {
         _core = core;
         _tickers = tickers;
         _interval = interval;
         _rng = new Random(seed);
+        _bench = bench;
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -62,11 +65,26 @@ public sealed class SimulatedFeed
             Console.Error.WriteLine($"edge-sim: {ticker} discovered ({listings.Count} listings) → core kept {sub.Keep.Count} pairs");
         }
 
+        // the hedge benchmark rides the Phase-3 spot-only path: register, no
+        // chain, then plain L1 spot ticks
+        if (_bench is { } bench)
+        {
+            await _core.SendAsync("spot_sub", new SpotSub { Ticker = bench.ticker }, ct);
+            spots[bench.ticker] = bench.spot;
+            Console.Error.WriteLine($"edge-sim: {bench.ticker} spot-only (hedge benchmark) announced");
+        }
+
         using var timer = new PeriodicTimer(_interval);
         var tick = 0;
         while (await timer.WaitForNextTickAsync(ct))
         {
             tick++;
+            if (_bench is { } hb)
+            {
+                var bp = spots[hb.ticker] * (1.0 + (_rng.NextDouble() - 0.5) * 0.0008);
+                spots[hb.ticker] = Math.Clamp(bp, hb.spot * 0.95, hb.spot * 1.05);
+                await _core.SendAsync("spot", new SpotEvent { Ticker = hb.ticker, Price = Math.Round(spots[hb.ticker], 2) }, ct);
+            }
             foreach (var (ticker, seedSpot, vol) in _tickers)
             {
                 // spot random walk, soft-bounded ±5%

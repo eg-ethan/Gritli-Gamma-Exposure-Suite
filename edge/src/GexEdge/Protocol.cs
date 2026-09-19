@@ -106,6 +106,16 @@ public sealed class SpotEvent
     [JsonPropertyName("price")] public double Price { get; set; }
 }
 
+public sealed record SpotSub
+{
+    [JsonPropertyName("ticker")] public string Ticker { get; set; } = "";
+}
+
+public sealed record SpotAck
+{
+    [JsonPropertyName("ticker")] public string Ticker { get; set; } = "";
+}
+
 public sealed class StatusEvent
 {
     [JsonPropertyName("linesUsed")] public int LinesUsed { get; set; }

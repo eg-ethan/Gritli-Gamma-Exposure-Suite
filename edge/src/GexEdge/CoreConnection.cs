@@ -157,6 +157,10 @@ public sealed class CoreConnection : IAsyncDisposable
                 case "error":
                     OnError?.Invoke(new EdgeProtocolException(Wire.Data<ErrorMsg>(env).Message));
                     break;
+                case "spot_ack":
+                    // spot-only registration landed (hedge benchmark); spots
+                    // may flow — nothing to correlate
+                    break;
                 case "pause":
                     OnPause?.Invoke();
                     break;

@@ -84,6 +84,12 @@ public sealed class TwsFeed : IDisposable
     // default bundle and cycle the whole chain ATM-first
     public bool NoSweep { get; init; }
 
+    /// Hedge benchmark (Phase 3, spec §3): a SPOT-ONLY ticker — one permanent
+    /// L1 line, no chain discovery, no sweeps, no OI rotation. Registered with
+    /// the core via spot_sub before the line goes up so its spot events apply
+    /// (unregistered spot is an unknown-ticker anomaly by design).
+    public string? HedgeBench { get; init; }
+
     // cancels the ACTIVE run's loops — one CTS per StartAsync pass: a pause
     // tears the run down and the next pass (resume) gets a fresh one
     private CancellationTokenSource? _runCts;
@@ -275,6 +281,10 @@ public sealed class TwsFeed : IDisposable
         {
             _ = DiscoverChainAsync(ticker, feedCt); // starts the underlying L1 line once the conId resolves
         }
+        if (!string.IsNullOrWhiteSpace(HedgeBench))
+        {
+            _ = SpotOnlyAsync(HedgeBench.Trim().ToUpperInvariant(), feedCt);
+        }
         try
         {
             await Task.Delay(Timeout.Infinite, feedCt);
@@ -365,6 +375,38 @@ public sealed class TwsFeed : IDisposable
     /// run with at most one stderr line — live 2026-09-09, NDX sent NOTHING
     /// all day while SPX worked. A ticker only stays dark now if TWS keeps
     /// refusing it, and every attempt says so on stderr.
+    /// SpotOnlyAsync wires the hedge benchmark's permanent L1 line: register
+    /// with the core FIRST (spot applies only for spot_sub-registered
+    /// tickers), then resolve the definition — routed by the resolved
+    /// exchange, the NDX/NASDAQ lesson — and subscribe exactly one line. A
+    /// dead or unentitled line leaves spot stale ON PURPOSE: the core's
+    /// staleness gate is the designed failure mode; a spot-only ticker has no
+    /// undPrice fallback to mask it.
+    private async Task SpotOnlyAsync(string ticker, CancellationToken ct)
+    {
+        try
+        {
+            await _core.SendAsync("spot_sub", new SpotSub { Ticker = ticker }, ct);
+            var (secType, exchange) = IndexPrimitives.For(ticker);
+            var client = _client;
+            if (client is null || !client.IsConnected())
+                return;
+            var def = await TwsCallbacks.ResolveUnderlyingAsync(client, _pacer, ticker,
+                secType, exchange, NextReqId, ct);
+            if (def is null)
+            {
+                Console.Error.WriteLine($"edge: {ticker}: spot-only definition unresolved — no L1 line; the core's staleness gate will hold");
+                return;
+            }
+            await SubscribeUnderlyingAsync(ticker, def, ct);
+            Console.Error.WriteLine($"edge: {ticker}: spot-only L1 line up (hedge benchmark)");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Console.Error.WriteLine($"edge: {ticker}: spot-only setup failed: {ex.Message}");
+        }
+    }
+
     private async Task DiscoverChainAsync(string ticker, CancellationToken ct)
     {
         // startup race: the ticker loops fire as the run starts — hold until
