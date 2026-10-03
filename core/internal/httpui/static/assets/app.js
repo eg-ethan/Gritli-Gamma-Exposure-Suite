@@ -472,6 +472,9 @@ function renderStatus() {
   const btn = $("master-btn");
   setText(btn, live ? "Disconnect" : "Connect");
   setClass(btn, `btn ${live ? "btn-disconnect" : "btn-connect"}`);
+  btn.title = live
+    ? "Stops any running sweeps and freezes this view — the edge keeps collecting (journal/db/CSV)"
+    : "Reconnect this view to the live feed (never starts a sweep by itself)";
   for (const id of ["underlying", "options"]) {
     const on = s.streams.find((x) => x.id === id)?.connected;
     $(`stream-${id}`).checked = !!on;
@@ -486,13 +489,13 @@ function renderStatus() {
   setText($("foot-conn"), live
     ? `Connected · ${S.st.ticker} · ${S.st.contracts} contracts`
     : (s.savedAsOfMs
-      ? `Disconnected · showing saved snapshot from ${new Date(s.savedAsOfMs).toLocaleString()}`
+      ? `Disconnected view · showing snapshot from ${new Date(s.savedAsOfMs).toLocaleString()} — collection continues`
       : "Disconnected · no saved snapshot yet — press Connect to load the feed"));
   setText($("stream-hint"), live
-    ? "Disconnect to freeze the view: the strike profile and the expiration table keep rendering from the saved state, no live feed needed."
+    ? "Disconnect stops any running sweeps and freezes this view — the edge keeps collecting for free (lines/rotation/CSV)."
     : (s.savedAsOfMs
-      ? "Disconnected — rendering the saved snapshot. Press Connect to resume the live feed."
-      : "No data yet — press Connect once to load the synthetic feed; the chain it builds is then saved for offline viewing."));
+      ? "Disconnected — rendering the saved snapshot. Collection is still running server-side; press Connect to resume the live view."
+      : "No data yet — press Connect once to load the feed; the chain it builds is then saved for offline viewing."));
 }
 
 function renderQuote() {
@@ -947,12 +950,12 @@ function renderWatchlist() {
     b.type = "button";
     b.className = `tick-btn ${w.active ? "active" : ""} ${w.custom ? "custom" : ""}`;
     const sw = sweepRowOf(w.ticker);
-    const dot = sw && sw.armed
-      ? `<span class="sweep-dot ${sw.intervalSeconds === sweepFastSeconds() ? "fast" : ""} ${sw.sweeping ? "live" : ""}"></span>`
+    const dot = sw && sw.pending
+      ? `<span class="sweep-dot ${sw.sweeping ? "live" : ""}"></span>`
       : "";
     b.innerHTML = w.ticker + (w.custom ? `<span class="cls">✎</span>` : "") + dot;
     b.title = (w.class && w.class !== w.ticker ? `options: ${w.class}` : w.ticker) +
-      (sw && sw.armed ? ` · sweep armed every ${sw.intervalSeconds}s${sw.sweeping ? " (sweeping)" : ""}` : "");
+      (sw && sw.pending ? ` · pass in flight${sw.sweeping ? " (sweeping)" : ""}` : "");
     b.onclick = () => (w.custom ? openCustomForm(w.ticker) : activateTicker(w.ticker));
     strip.appendChild(b);
   }
@@ -1380,34 +1383,37 @@ $("hedge-legs").addEventListener("click", async (e) => {
 setInterval(pollHedge, 2000);
 pollHedge();
 
-/* ── Snapshot sweeper (GUI-controlled, max 2, cost-guarded) ───────────
+/* ── Snapshot sweeper (GUI-controlled one-pass, max 2 in flight) ──────
    Everything renders from GET /api/sweeps (knobs live in the core's
-   sweep_policy.go — intervals, costs, cap, windows). Sweeps never start on
-   their own: the roster changes only through these toggles, and every POST
-   sends the FULL roster (set semantics). Rejects come back 409 with the
-   operator reason, shown inline; the roster is untouched on reject.
-   Windows are sticky: a closed window clears the armed row server-side and
-   nothing re-arms it until toggled again. */
+   sweep_policy.go — per-pass estimates, cap, windows). Sweeps never start
+   on their own: the ONLY way money moves is this panel's "Run 1 pass"
+   button. Each click fires exactly ONE full-chain pass on the edge (~$0.01
+   per snapshot over the filtered chain); the row returns to idle by itself
+   when the pass completes (sweep_done). No cadence, no repeating. POSTs
+   send the FULL in-flight set (set semantics — removing a running ticker
+   aborts its pass). Rejects come back 409 with the operator reason, shown
+   inline; the roster is untouched on reject. Windows are sticky: a closed
+   window clears the running row server-side and nothing re-runs until
+   clicked again inside the window. */
 S.sweeps = null;       // last SweepsView
-S.sweepPick = {};      // ticker → interval chosen on an un-armed row
 S.sweepErr = {};       // ticker → inline refusal ("" key = panel-level)
 S.sweepBusy = false;   // a POST is in flight
+S.sweepBase = {};      // ticker → edge snapshotSpend when its pass was clicked (delta display)
 
 function sweepRowOf(ticker) {
   return S.sweeps?.rows?.find((r) => r.ticker === ticker) || null;
 }
-function sweepFastSeconds() {
-  return S.sweeps?.intervals?.find((i) => i.min)?.seconds ?? 15;
-}
-function sweepDefaultSeconds() {
-  return S.sweeps?.intervals?.find((i) => !i.min)?.seconds ?? 60;
-}
 function sweepDotSig(ticker) {
   const r = sweepRowOf(ticker);
-  return r && r.armed ? `${r.intervalSeconds}${r.sweeping ? "L" : ""}` : "";
+  return r && r.pending ? (r.sweeping ? "L" : "P") : "";
 }
-function sweepIntervalOf(seconds) {
-  return S.sweeps?.intervals?.find((i) => i.seconds === seconds) || null;
+/* pass price label: observed chains price exactly, unknown chains (the free
+   slot's custom pick) fall back to the generic chain × $0.01 form */
+function sweepPriceLabel(r) {
+  return r.estimate > 0 ? `≈${fmtCost(r.estimate)}` : "≈$0.01 × chain";
+}
+function sweepMinutesLabel(r) {
+  return r.estSeconds > 0 ? `~${Math.max(1, Math.round(r.estSeconds / 60))} min` : "a few min";
 }
 function fmtCost(v) {
   return "$" + (v || 0).toFixed(2);
@@ -1437,21 +1443,19 @@ async function pollSweeps() {
 
 function applySweepsView(v) {
   S.sweeps = v && v.enabled ? v : null;
-  // drop inline refusals for tickers that are now armed (the refusal is stale)
-  for (const r of S.sweeps?.rows || []) if (r.armed) delete S.sweepErr[r.ticker];
+  // drop inline refusals for tickers that are now running (the refusal is stale)
+  for (const r of S.sweeps?.rows || []) if (r.pending) delete S.sweepErr[r.ticker];
   renderSweeper();
   renderSweepBanner();
   renderMasterCountdown();
   renderWatchlist();
 }
 
-function armedRoster() {
-  return (S.sweeps?.rows || [])
-    .filter((r) => r.armed)
-    .map((r) => ({ ticker: r.ticker, intervalSeconds: r.intervalSeconds }));
+function pendingTickers() {
+  return (S.sweeps?.rows || []).filter((r) => r.pending).map((r) => r.ticker);
 }
 
-/* POST the full roster (or {kill:true}); 409 → inline reason, roster unchanged */
+/* POST the full in-flight set (or {kill:true}); 409 → inline reason, roster unchanged */
 async function postSweeps(body, errKey) {
   if (S.sweepBusy) return;
   S.sweepBusy = true;
@@ -1482,9 +1486,10 @@ async function postSweeps(body, errKey) {
 function toggleSweep(ticker) {
   const row = sweepRowOf(ticker);
   if (!row) return;
-  const roster = armedRoster();
-  if (row.armed) {
-    postSweeps({ tickers: roster.filter((e) => e.ticker !== ticker) }, ticker);
+  const roster = pendingTickers();
+  if (row.pending) {
+    // Stop: removing a running ticker aborts its pass mid-flight
+    postSweeps({ tickers: roster.filter((t) => t !== ticker) }, ticker);
     return;
   }
   // refused client-side before any POST: blocked window or cap (the core
@@ -1496,23 +1501,13 @@ function toggleSweep(ticker) {
   }
   const max = S.sweeps.max || 2;
   if (roster.length >= max) {
-    S.sweepErr[ticker] = `max ${max} sweeps — turn one off first`;
+    S.sweepErr[ticker] = `max ${max} passes in flight — wait or stop one first`;
     renderSweeper();
     return;
   }
-  const secs = S.sweepPick[ticker] || sweepDefaultSeconds();
-  postSweeps({ tickers: [...roster, { ticker, intervalSeconds: secs }] }, ticker);
-}
-
-function pickSweepInterval(ticker, secs) {
-  S.sweepPick[ticker] = secs;
-  const row = sweepRowOf(ticker);
-  if (row && row.armed && row.intervalSeconds !== secs) {
-    // an armed row's cadence change re-installs the roster with the new interval
-    postSweeps({ tickers: armedRoster().map((e) => (e.ticker === ticker ? { ticker, intervalSeconds: secs } : e)) }, ticker);
-  } else {
-    renderSweeper();
-  }
+  // baseline the spend meter so the row can show this pass's metered delta
+  S.sweepBase[ticker] = S.sweeps?.edge?.snapshotSpend ?? 0;
+  postSweeps({ tickers: [...roster, ticker] }, ticker);
 }
 
 function renderSweeper() {
@@ -1522,44 +1517,48 @@ function renderSweeper() {
   if (!v) return;
 
   const max = v.max || 2;
-  const armedN = (v.rows || []).filter((r) => r.armed).length;
-  setText($("sweep-cap-hint"), `${armedN}/${max} armed · never auto-starts`);
+  const runningN = (v.rows || []).filter((r) => r.pending).length;
+  setText($("sweep-cap-hint"), `${runningN}/${max} running · never auto-starts`);
 
   const box = $("sweeper-rows");
-  const sig = JSON.stringify([v.rows, v.intervals, S.sweepPick, S.sweepErr, S.sweepBusy, v.edge?.connected]);
+  const sig = JSON.stringify([v.rows, S.sweepErr, S.sweepBusy, v.edge?.connected, S.sweepBase]);
   if (box.dataset.sig !== sig) {
     box.dataset.sig = sig;
-    const fast = sweepFastSeconds();
     box.innerHTML = (v.rows || []).map((r) => {
       const t = escHTML(r.ticker);
-      const secs = r.armed ? r.intervalSeconds : (S.sweepPick[r.ticker] || sweepDefaultSeconds());
-      const isFast = secs === fast;
       const blocked = !r.allowed;
-      const capped = !r.armed && armedN >= max;
-      const opts = (v.intervals || []).map((i) =>
-        `<option value="${i.seconds}" ${i.seconds === secs ? "selected" : ""}>${escHTML(i.label)}</option>`).join("");
+      const capped = !r.pending && runningN >= max;
       let live = "", liveCls = "";
-      if (r.armed) {
-        if (r.sweeping) { live = "sweeping"; liveCls = "on"; }
-        else if (!v.edge?.connected) { live = "edge off"; liveCls = "wait"; }
-        else { live = "arming"; liveCls = "wait"; }
+      let delta = null;
+      if (r.pending) {
+        if (r.sweeping) {
+          live = "sweeping"; liveCls = "on";
+          const base = S.sweepBase[r.ticker];
+          if (base != null && v.edge) delta = Math.max(0, v.edge.snapshotSpend - base);
+        } else if (!v.edge?.connected) { live = "edge off"; liveCls = "wait"; }
+        else { live = "starting"; liveCls = "wait"; }
       }
       const err = S.sweepErr[r.ticker];
       let sub = "";
       if (err) sub = `<div class="sweep-sub err">${escHTML(err)}</div>`;
       else if (blocked) sub = `<div class="sweep-sub">${escHTML(r.reason || "blocked")}${r.opensAtMs ? ` · reopens ${escHTML(fmtET(r.opensAtMs))}` : ""}</div>`;
-      else if (r.armed) {
-        const iv = sweepIntervalOf(secs);
-        sub = `<div class="sweep-sub">every ${secs}s · ≈${fmtCost(iv?.costPerHour)}/hr${iv?.min ? " min" : ""}</div>`;
-      } else if (capped) sub = `<div class="sweep-sub">max ${max} armed</div>`;
-      return `<div class="sweep-row ${r.armed ? "armed" : ""} ${r.armed && isFast ? "fast" : ""} ${blocked ? "blocked" : ""}">
+      else if (r.pending) {
+        sub = `<div class="sweep-sub">one full-chain pass · ${sweepMinutesLabel(r)} · ` +
+              `${delta != null ? `${fmtCost(delta)} metered so far` : `${sweepPriceLabel(r)} metered`} — stop anytime</div>`;
+      } else if (r.lastPassMs) {
+        sub = `<div class="sweep-sub">fresh as of ${fmtTime(r.lastPassMs)} · next pass ${sweepPriceLabel(r)} · ${sweepMinutesLabel(r)}</div>`;
+      } else if (capped) {
+        sub = `<div class="sweep-sub">max ${max} passes in flight</div>`;
+      } else {
+        sub = `<div class="sweep-sub">one full-chain pass · ${sweepPriceLabel(r)} · ${sweepMinutesLabel(r)}</div>`;
+      }
+      return `<div class="sweep-row ${r.pending ? "armed" : ""} ${blocked ? "blocked" : ""}">
         <div class="sweep-row-main">
-          <button type="button" class="sweep-toggle ${r.armed ? "on" : ""} ${isFast ? "fast" : ""}" data-sweep-toggle="${t}"
-            ${S.sweepBusy ? "disabled" : ""} aria-pressed="${r.armed}"
-            title="${blocked ? escHTML(r.reason || "blocked") : r.armed ? "Turn this sweep off" : "Arm a metered snapshot sweep"}">
-            Sweep ${t} — <span class="st">${r.armed ? "ON" : "OFF"}</span>
+          <button type="button" class="sweep-toggle ${r.pending ? "on" : ""}" data-sweep-toggle="${t}"
+            ${S.sweepBusy ? "disabled" : ""} aria-pressed="${r.pending}"
+            title="${blocked ? escHTML(r.reason || "blocked") : r.pending ? `Stop the running pass on ${t}` : `Run ONE full-chain pass on ${t}: ${sweepPriceLabel(r)} metered, ${sweepMinutesLabel(r)}`}">
+            ${r.pending ? `Stop ${t}` : `Run 1 pass · ${t}`} <span class="st">${r.pending ? "▮▮" : `· ${sweepPriceLabel(r)} · ${sweepMinutesLabel(r)}`}</span>
           </button>
-          <select data-sweep-interval="${t}" aria-label="Sweep interval for ${t}" ${S.sweepBusy ? "disabled" : ""}>${opts}</select>
           <span class="sweep-live ${liveCls}">${live}</span>
         </div>
         ${sub}
@@ -1571,8 +1570,7 @@ function renderSweeper() {
   setText($("sweep-spend"), e ? fmtCost(e.snapshotSpend) : "—");
   setText($("sweep-live"), !e ? "no edge heartbeat"
     : !e.connected ? "edge disconnected"
-    : (e.sweepActive && e.sweepActive.length ? e.sweepActive.join(", ") : "nothing")
-      + (e.sweepWindowOpen === false ? " · window closed" : ""));
+    : (e.sweepActive && e.sweepActive.length ? e.sweepActive.join(", ") : "nothing"));
 
   const panelErr = S.sweepErr[""];
   const errEl = $("sweep-error");
@@ -1585,50 +1583,30 @@ $("sweeper-rows").addEventListener("click", (ev) => {
   const b = ev.target.closest("[data-sweep-toggle]");
   if (b && !b.disabled) toggleSweep(b.dataset.sweepToggle);
 });
-$("sweeper-rows").addEventListener("change", (ev) => {
-  const sel = ev.target.closest("[data-sweep-interval]");
-  if (sel) pickSweepInterval(sel.dataset.sweepInterval, parseInt(sel.value, 10));
-});
 
-/* Fixed top banner: yellow at 60s cadences, red when any 15s ticker is armed
-   (its figure is a floor → "min"). Two tickers add per-ticker "each" and a
-   combined total. Renders from the armed roster, not the heartbeat — armed
-   means money can be spent. */
+/* Fixed top banner while a pass runs — the disclaimer the click deserves:
+   what is running, how long it takes, what it costs, how to stop. Renders
+   from the pending roster (pending means money is moving or about to). */
 function renderSweepBanner() {
   const el = $("sweep-banner");
-  const armed = (S.sweeps?.rows || []).filter((r) => r.armed);
+  const running = (S.sweeps?.rows || []).filter((r) => r.pending);
   const kill = $("sweep-kill");
-  // the pill also shows if the edge heartbeat still reports a live loop with
+  // the pill also shows if the edge heartbeat still reports a live pass with
   // an empty roster (stale edge) — one click pushes the empty roster again
   const edgeLive = (S.sweeps?.edge?.sweepActive || []).length > 0;
-  kill.classList.toggle("hidden", !armed.length && !edgeLive);
+  kill.classList.toggle("hidden", !running.length && !edgeLive);
   kill.disabled = S.sweepBusy;
-  if (!armed.length) {
+  if (!running.length) {
     el.classList.add("hidden");
     document.body.classList.remove("has-sweep-banner");
     return;
   }
-  const costOf = (r) => sweepIntervalOf(r.intervalSeconds) || { costPerHour: 0, min: false };
-  const anyMin = armed.some((r) => costOf(r).min);
-  const total = S.sweeps.costPerHour ?? armed.reduce((a, r) => a + costOf(r).costPerHour, 0);
-  const minTag = (m) => (m ? " min" : "");
-  let text;
-  const sameCadence = armed.every((r) => r.intervalSeconds === armed[0].intervalSeconds);
-  if (armed.length === 1) {
-    const c = costOf(armed[0]);
-    text = `SWEEPER ON — ${armed[0].ticker} · every ${armed[0].intervalSeconds}s · ≈${fmtCost(c.costPerHour)}/hr${minTag(c.min)}`;
-  } else if (sameCadence) {
-    const c = costOf(armed[0]);
-    text = `SWEEPER ON — ${armed.map((r) => r.ticker).join(", ")} · every ${armed[0].intervalSeconds}s · ` +
-      `≈${fmtCost(c.costPerHour)}/hr${minTag(c.min)} each · ${fmtCost(total)}/hr${minTag(anyMin)} total`;
-  } else {
-    text = "SWEEPER ON — " + armed.map((r) => {
-      const c = costOf(r);
-      return `${r.ticker} · every ${r.intervalSeconds}s · ≈${fmtCost(c.costPerHour)}/hr${minTag(c.min)}`;
-    }).join(" | ") + ` · ${fmtCost(total)}/hr${minTag(anyMin)} total`;
-  }
-  setText(el, text);
-  setClass(el, `sweep-banner ${S.sweeps.anyFast || anyMin ? "fast" : ""}`);
+  const names = running.map((r) => r.ticker).join(", ");
+  const price = running.length === 1 ? sweepPriceLabel(running[0]) : "each " + running.map((r) => sweepPriceLabel(r)).join(", ");
+  const mins = running.length === 1 ? sweepMinutesLabel(running[0])
+    : `roughly ${Math.max(1, Math.round(Math.max(...running.map((r) => r.estSeconds || 180)) / 60))} min`;
+  setText(el, `ONE-PASS SWEEP RUNNING — ${names} · takes ${mins} to complete · ${price} metered — stop anytime`);
+  setClass(el, "sweep-banner");
   document.body.classList.add("has-sweep-banner");
 }
 
@@ -1659,42 +1637,9 @@ setInterval(pollSweeps, 2000);
 setInterval(renderMasterCountdown, 1000);
 pollSweeps();
 
-/* ───────────────── hidden-tab meter guard ─────────────────
-   GUI Disconnect now carries to the edge (core pause → the edge tears its
-   TWS session down, snapshot meter included). A hidden tab means nobody is
-   watching: auto-disconnect after a grace period, auto-reconnect when
-   visible again. A MANUAL Disconnect is never overridden — auto-resume
-   only reverses what the auto-pause did. Closing the tab disconnects too
-   (pagehide), and a reload restores the previous live state. */
-let autoPausedByHide = false;
-let hideTimer = null;
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    hideTimer = setTimeout(() => {
-      if (!document.hidden || autoPausedByHide) return;
-      if (S.st?.status.connected) {
-        autoPausedByHide = true;
-        postStream("all", false);
-      }
-    }, 10000); // grace: brief tab switches don't cycle the feed
-  } else {
-    clearTimeout(hideTimer);
-    if (autoPausedByHide) {
-      autoPausedByHide = false;
-      if (!S.st?.status.connected) postStream("all", true);
-    }
-  }
-});
-window.addEventListener("pagehide", () => {
-  clearTimeout(hideTimer);
-  if (S.st?.status.connected) {
-    try { sessionStorage.setItem("gex-was-live", "1"); } catch {}
-    postStream("all", false);
-  } else {
-    try { sessionStorage.removeItem("gex-was-live"); } catch {}
-  }
-});
-if (sessionStorage.getItem("gex-was-live") === "1") {
-  try { sessionStorage.removeItem("gex-was-live"); } catch {}
-  postStream("all", true); // reload after a live session: come back live
-}
+/* ───────────────── (v2) no hidden-tab guard ─────────────────
+   The edge collects continuously regardless of GUI state: hiding or closing
+   the tab changes nothing (in-flight passes simply run to completion), so
+   the old auto-disconnect/auto-reconnect dance is gone. The Disconnect
+   button is the one deliberate stop: it drops the live view AND stops all
+   sweeps, while collection (journal/db/CSV) keeps recording server-side. */

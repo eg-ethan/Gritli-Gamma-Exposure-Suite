@@ -69,23 +69,21 @@ type Server struct {
 	done      chan struct{}
 	closeOnce sync.Once
 	closeErr  error
-	// feeds gates DISPATCH of inbound events: false = frozen (the GUI's
-	// Disconnect with an external feed). Connections stay up and seq is
-	// still observed — no phantom gaps on resume — but nothing is applied,
-	// counted, or journaled while frozen. Toggling also pushes pause/resume
-	// to every live edge so its TWS-side request machinery stops spending.
-	feeds atomic.Bool
 
 	connsMu sync.Mutex
 	conns   map[*connWriter]string // writer → session id
 
 	// sweep roster (GUI-controlled, capped at SweepMaxTickers, cost-guarded):
-	// the authoritative list of tickers whose snapshot sweeps may run. Empty
+	// the authoritative set of tickers with a one-pass sweep IN FLIGHT. Empty
 	// by construction on boot/resume — nothing ever auto-arms — and pushed to
 	// every edge on change and after every hello (empty push included, so a
-	// core restart stops a stale edge: fail-closed).
+	// core restart stops a stale edge: fail-closed). Entries leave via
+	// sweep_done (pass finished or refused) or a roster update (kill/Stop).
+	// lastPass stamps each ticker's last COMPLETED pass for the GUI's
+	// "fresh as of" row.
 	sweepsMu    sync.Mutex
 	sweepRoster []SweepEntry
+	lastPass    map[string]int64
 
 	logFn func(format string, args ...any)
 }
@@ -106,41 +104,12 @@ func Listen(addr string, core *Core, journal *Journal, logFn func(string, ...any
 	s := &Server{
 		ln: ln, core: core, diag: core.Diagnostics(), journal: journal,
 		done: make(chan struct{}), logFn: logFn,
-		conns: map[*connWriter]string{},
+		conns: map[*connWriter]string{}, lastPass: map[string]int64{},
 	}
-	s.feeds.Store(true)
+	core.sweepDoneHook = s.onSweepDone
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return s, nil
-}
-
-// SetFeeds freezes (false) or resumes (true) the dispatch of inbound edge
-// events across ALL connections — the GUI's Disconnect/Connect when an
-// external feed owns the streams. Sessions and seq tracking survive, so
-// resuming neither drops nor fabricates gaps. Toggling also pushes
-// pause/resume to every live edge session: the edge must stop its TWS-side
-// request machinery (snapshots, OI rotations, sweeps) while paused, or the
-// meter keeps running behind a frozen GUI.
-func (s *Server) SetFeeds(on bool) {
-	s.feeds.Store(on)
-	typ := TypeResume
-	if !on {
-		typ = TypePause
-	}
-	s.connsMu.Lock()
-	writers := make([]*connWriter, 0, len(s.conns))
-	for cw := range s.conns {
-		writers = append(writers, cw)
-	}
-	s.connsMu.Unlock()
-	for _, cw := range writers {
-		if err := cw.send(Outbound{Type: typ, TS: s.core.cfg.Now().UnixMilli()}); err != nil {
-			s.logFn("edge: %s push %s: %v", typ, err)
-		}
-	}
-	if len(writers) > 0 {
-		s.logFn("edge: %s → %d session(s)", typ, len(writers))
-	}
 }
 
 // Addr reports the bound address (tests use :0).
@@ -148,12 +117,17 @@ func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 
 // ── sweep control (sweep_policy.go owns the knobs) ──────────────────────
 
-// SetSweeps validates and installs the ENTIRE roster (set semantics, not a
-// delta) and pushes it to every live edge. Validation: policy intervals and
+// SetSweeps validates and installs the ENTIRE in-flight roster (set
+// semantics, not a delta) and pushes it to every live edge — added tickers
+// start their one pass, removed tickers are aborted mid-flight. Validation:
 // cap (ValidateRoster), then every entry must sit inside its shutoff window
-// right now — a blocked toggle is refused with its operator reason (the GUI
+// right now — a blocked click is refused with its operator reason (the GUI
 // shows it inline; the roster is left untouched).
-func (s *Server) SetSweeps(entries []SweepEntry) error {
+func (s *Server) SetSweeps(tickers []string) error {
+	entries := make([]SweepEntry, 0, len(tickers))
+	for _, t := range tickers {
+		entries = append(entries, SweepEntry{Ticker: t})
+	}
 	roster, err := ValidateRoster(entries)
 	if err != nil {
 		return err
@@ -169,15 +143,67 @@ func (s *Server) SetSweeps(entries []SweepEntry) error {
 	s.sweepsMu.Unlock()
 	s.pushSweeps()
 	if len(roster) > 0 {
-		s.logFn("edge: sweep roster armed: %s", rosterString(roster))
+		s.logFn("edge: sweep pass requested: %s", rosterString(roster))
 	} else {
 		s.logFn("edge: sweep roster cleared (kill)")
 	}
 	return nil
 }
 
-// ClearSweeps empties the roster (the GUI's kill pill) and pushes the empty
-// set — one click deselects everything.
+// onSweepDone is the roster hook the ingest core calls for every sweep_done:
+// the ticker's entry leaves the roster (a finished or refused pass never
+// re-arms), a completed pass stamps lastPass for the GUI row, and the
+// shrunken roster is pushed so every later hello re-pushes the authoritative
+// set — a stale edge can never re-run a pass the core already retired.
+func (s *Server) onSweepDone(ev SweepDone) {
+	now := s.core.cfg.Now()
+	s.sweepsMu.Lock()
+	kept := s.sweepRoster[:0:0]
+	dropped := false
+	for _, e := range s.sweepRoster {
+		if e.Ticker == ev.Ticker {
+			dropped = true
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if dropped {
+		s.sweepRoster = kept
+	}
+	if ev.Ok {
+		s.lastPass[ev.Ticker] = now.UnixMilli()
+	}
+	s.sweepsMu.Unlock()
+	if !dropped {
+		// an abort racing the roster update that removed it, or a duplicate
+		// done — nothing to retire, just log
+		s.logFn("edge: sweep pass %s (%s) — not in roster", doneWord(ev), ev.Ticker)
+		return
+	}
+	s.pushSweeps()
+	if ev.Ok {
+		s.logFn("edge: sweep pass done: %s (%d contracts)", ev.Ticker, ev.Requested)
+	} else {
+		s.logFn("edge: sweep pass %s: %s (%s)", ev.Ticker, doneWord(ev), orUnknown(ev.Reason))
+	}
+}
+
+func doneWord(ev SweepDone) string {
+	if ev.Ok {
+		return "ok"
+	}
+	return "stopped"
+}
+
+func orUnknown(reason string) string {
+	if reason == "" {
+		return "no reason given"
+	}
+	return reason
+}
+
+// ClearSweeps empties the roster (the GUI's kill pill and Disconnect button)
+// and pushes the empty set — in-flight passes are aborted on the edge.
 func (s *Server) ClearSweeps() {
 	_ = s.SetSweeps(nil)
 }
@@ -189,11 +215,11 @@ func (s *Server) SweepRoster() []SweepEntry {
 	return append([]SweepEntry(nil), s.sweepRoster...)
 }
 
-// EnforceSweepWindows applies the sticky shutoff: armed entries whose window
-// has closed are DROPPED (not suspended — re-arming is a manual toggle), the
-// shrunken roster is pushed, and the cleared tickers are returned for the
-// log. Called by RunSweepMonitor every SweepMonitorEvery and directly in
-// tests.
+// EnforceSweepWindows applies the sticky shutoff: in-flight entries whose
+// window has closed are DROPPED (not suspended — re-arming is a manual
+// click), the shrunken roster is pushed (aborting a mid-flight pass on the
+// edge), and the cleared tickers are returned for the log. Called by
+// RunSweepMonitor every SweepMonitorEvery and directly in tests.
 func (s *Server) EnforceSweepWindows(now time.Time) []string {
 	s.sweepsMu.Lock()
 	var cleared []string
@@ -211,7 +237,7 @@ func (s *Server) EnforceSweepWindows(now time.Time) []string {
 	s.sweepsMu.Unlock()
 	if len(cleared) > 0 {
 		s.pushSweeps()
-		s.logFn("edge: sweep window closed — cleared (sticky, re-arm manually): %v", cleared)
+		s.logFn("edge: sweep window closed — cleared (sticky, re-run manually): %v", cleared)
 	}
 	return cleared
 }
@@ -259,28 +285,27 @@ func (s *Server) pushSweepsTo(cw *connWriter) error {
 }
 
 // SweepsView assembles the /api/sweeps read model: one row per watchlist
-// ticker (armed / actually sweeping / window state + reason + reopen time),
-// the selectable intervals with their cost figures, the combined metered
-// burn, the live edge heartbeat, and the master-log state.
+// ticker (pass pending / actually sweeping / window state + reason + reopen
+// time / last-pass freshness / per-pass price + duration estimates), the
+// live edge heartbeat, and the master-log state.
 func (s *Server) SweepsView(tickers []string, master MasterLogInfo, now time.Time) SweepsView {
 	roster := s.SweepRoster()
-	byTicker := make(map[string]SweepEntry, len(roster))
+	inFlight := make(map[string]bool, len(roster))
 	for _, e := range roster {
-		byTicker[e.Ticker] = e
+		inFlight[e.Ticker] = true
 	}
-	view := SweepsView{
-		Enabled: true,
-		Max:     SweepMaxTickers,
-		Intervals: []SweepInterval{
-			{Seconds: SweepDefaultSeconds, Label: "60s", CostPerHour: SweepCostPerHour},
-			{Seconds: SweepFastSeconds, Label: "15s", CostPerHour: SweepFastCostPerHourMin, Min: true},
-		},
-		MasterLog: master,
+	s.sweepsMu.Lock()
+	lastPass := make(map[string]int64, len(s.lastPass))
+	for t, ms := range s.lastPass {
+		lastPass[t] = ms
 	}
+	s.sweepsMu.Unlock()
+
+	view := SweepsView{Enabled: true, Max: SweepMaxTickers, MasterLog: master}
 	if st := s.core.LastStatus(); st != nil {
 		active := append([]string(nil), st.SweepActive...)
 		view.Edge = &SweepEdgeStatus{
-			Connected: st.Connected, SweepActive: active, WindowOpen: st.SweepWindowOpen,
+			Connected: st.Connected, SweepActive: active,
 			LinesUsed: st.LinesUsed, MsgRate: st.MsgRate, SnapshotSpend: st.SnapshotSpend,
 		}
 	}
@@ -291,15 +316,13 @@ func (s *Server) SweepsView(tickers []string, master MasterLogInfo, now time.Tim
 			row.Reason = Reason(t, now)
 			row.OpensAtMs = NextOpen(t, now).UnixMilli()
 		}
-		if e, ok := byTicker[t]; ok {
-			row.Armed = true
-			row.IntervalSeconds = e.IntervalSeconds
-			if cost, valid := SweepCostForInterval(e.IntervalSeconds); valid {
-				view.CostPerHour += cost
-			}
-			if e.IntervalSeconds == SweepFastSeconds {
-				view.AnyFast = true
-			}
+		if est, ok := SweepEstimate(t); ok {
+			row.Estimate = est
+			row.EstSeconds = SweepEstSeconds(t)
+		}
+		row.LastPassMs = lastPass[t]
+		if inFlight[t] {
+			row.Pending = true
 			if view.Edge != nil {
 				for _, a := range view.Edge.SweepActive {
 					if a == t {
@@ -318,7 +341,7 @@ func (s *Server) SweepsView(tickers []string, master MasterLogInfo, now time.Tim
 func rosterString(roster []SweepEntry) string {
 	parts := make([]string, 0, len(roster))
 	for _, e := range roster {
-		parts = append(parts, fmt.Sprintf("%s/%ds", e.Ticker, e.IntervalSeconds))
+		parts = append(parts, e.Ticker)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -352,8 +375,8 @@ func (s *Server) acceptLoop() {
 }
 
 // handleConn is the per-connection read loop. Replies and pushes share the
-// connWriter (its lock serializes writes), so a SetFeeds push can land
-// between replies without corrupting the stream.
+// connWriter (its lock serializes writes), so a roster push can land between
+// replies without corrupting the stream.
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
@@ -394,42 +417,12 @@ func (s *Server) handleConn(conn net.Conn) {
 				Data: ErrorMsg{Code: "bad_envelope", Message: err.Error()}})
 			continue
 		}
-		if s.feeds.Load() {
-			if s.journal != nil {
-				if err := s.journal.Record("in", line, s.core.cfg.Now()); err != nil {
-					s.logFn("edge: journal in: %v", err)
-				}
+		if s.journal != nil {
+			if err := s.journal.Record("in", line, s.core.cfg.Now()); err != nil {
+				s.logFn("edge: journal in: %v", err)
 			}
 		}
 		s.diag.observeSeq(env.Seq)
-
-		if !s.feeds.Load() {
-			// frozen: seq observed above, nothing applied or counted. hello
-			// still completes (the edge needs the handshake to reach a
-			// stable paused state instead of spinning its reconnect loop),
-			// followed by pause so a session that connected while frozen
-			// learns the state it must idle in — and the roster push, so the
-			// paused edge converges to the authoritative sweep set.
-			if env.Type == TypeHello || env.Type == TypePing {
-				for _, out := range s.core.Dispatch(sess, env) {
-					if err := cw.send(out); err != nil {
-						s.logFn("edge: %s write: %v", sess.ID, err)
-						return
-					}
-				}
-				if env.Type == TypeHello {
-					if err := cw.send(Outbound{Type: TypePause, TS: s.core.cfg.Now().UnixMilli()}); err != nil {
-						s.logFn("edge: %s write: %v", sess.ID, err)
-						return
-					}
-					if err := s.pushSweepsTo(cw); err != nil {
-						s.logFn("edge: %s write: %v", sess.ID, err)
-						return
-					}
-				}
-			}
-			continue
-		}
 
 		for _, out := range s.core.Dispatch(sess, env) {
 			if err := cw.send(out); err != nil {

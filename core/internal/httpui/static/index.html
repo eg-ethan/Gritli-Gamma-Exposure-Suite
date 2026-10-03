@@ -8,8 +8,9 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23111827'/><rect x='3' y='8' width='2.4' height='5' fill='%23ef4444'/><rect x='6.8' y='4' width='2.4' height='9' fill='%2322c55e'/><rect x='10.6' y='6' width='2.4' height='7' fill='%233b82f6'/></svg>">
 </head>
 <body>
-<!-- Fixed sweeper banner: yellow at 60s cadences, red when any 15s ticker is
-     armed (its cost is a floor). Shifts the app down while visible. -->
+<!-- Fixed sweeper banner: shows while a one-pass sweep runs — what is
+     running, how long it takes, what it costs, how to stop. Shifts the app
+     down while visible. -->
 <div id="sweep-banner" class="sweep-banner hidden"></div>
 <div id="app">
 
@@ -271,11 +272,11 @@
         </div>
       </section>
 
-      <!-- Snapshot Sweeper (GUI-controlled, max 2, cost-guarded) -->
+      <!-- Snapshot Sweeper (GUI-controlled one-pass, max 2 in flight) -->
       <section class="panel hidden" id="panel-sweeper">
         <div class="panel-head">
           <h2><span class="accent">▎</span>Snapshot Sweeper</h2>
-          <span class="muted small" id="sweep-cap-hint">max 2 · never auto-starts</span>
+          <span class="muted small" id="sweep-cap-hint">0/2 running · never auto-starts</span>
         </div>
         <div class="panel-body stream-body">
           <div id="sweeper-rows"></div>
@@ -283,7 +284,7 @@
             <div><span>Metered spend</span><span id="sweep-spend">$0.00</span></div>
             <div><span>Edge sweeping</span><span id="sweep-live">—</span></div>
           </div>
-          <div class="hint muted small">Sweeps cost ~$0.01 per snapshot and never start on their own — each ticker arms only by your toggle, max 2, and stops (sticky) at its shutoff window. The $0 spot feed is separate and stays untouched.</div>
+          <div class="hint muted small">One pass ≈ the filtered chain × ~$0.01, runs once per click, then stops by itself — nothing ever sweeps at boot and nothing repeats. Max 2 passes in flight; sticky shutoff at each ticker's window. The $0 spot/rotation/OI feeds are separate and always on.</div>
           <div id="sweep-error" class="sweep-error hidden"></div>
         </div>
       </section>
@@ -348,8 +349,8 @@
   </footer>
 </div>
 
-<!-- Fixed red kill pill (bottom-left): one click deselects every sweep. -->
-<button id="sweep-kill" class="sweep-kill hidden" type="button">⛔ KILL ALL SWEEPS</button>
+<!-- Fixed red kill pill (bottom-left): one click aborts every in-flight pass. -->
+<button id="sweep-kill" class="sweep-kill hidden" type="button">⛔ STOP ALL SWEEPS</button>
 <!-- Fixed master-log countdown (bottom-right): ticks to the next CSV flush. -->
 <div id="master-countdown" class="master-countdown hidden"></div>
 

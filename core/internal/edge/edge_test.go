@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -932,16 +935,16 @@ func TestSimulatorEndToEnd(t *testing.T) {
 
 // TestProtocolEnvelopeValidation: version/type/seq rules.
 func TestProtocolEnvelopeValidation(t *testing.T) {
-	if _, err := decodeEnvelope([]byte(`{"v":2,"seq":1,"type":"ping","ts":1}`)); err == nil {
+	if _, err := decodeEnvelope([]byte(fmt.Sprintf(`{"v":%d,"seq":1,"type":"ping","ts":1}`, ProtoVersion+1))); err == nil {
 		t.Fatal("wrong version must fail")
 	}
-	if _, err := decodeEnvelope([]byte(`{"v":1,"seq":1,"ts":1}`)); err == nil {
+	if _, err := decodeEnvelope([]byte(fmt.Sprintf(`{"v":%d,"seq":1,"ts":1}`, ProtoVersion))); err == nil {
 		t.Fatal("missing type must fail")
 	}
-	if _, err := decodeEnvelope([]byte(`{"v":1,"seq":0,"type":"ping","ts":1}`)); err == nil {
+	if _, err := decodeEnvelope([]byte(fmt.Sprintf(`{"v":%d,"seq":0,"type":"ping","ts":1}`, ProtoVersion))); err == nil {
 		t.Fatal("seq < 1 must fail")
 	}
-	env, err := decodeEnvelope([]byte(fmt.Sprintf(`{"v":1,"seq":3,"type":"%s","ts":42,"data":{"ticker":"SPX","price":6600.5}}`, TypeSpot)))
+	env, err := decodeEnvelope([]byte(fmt.Sprintf(`{"v":%d,"seq":3,"type":"%s","ts":42,"data":{"ticker":"SPX","price":6600.5}}`, ProtoVersion, TypeSpot)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -951,18 +954,192 @@ func TestProtocolEnvelopeValidation(t *testing.T) {
 	}
 }
 
-// TestFeedsGateFreeze: SetFeeds(false) is the GUI Disconnect path for an
-// external feed — inbound events are read (seq observed, so resuming cannot
-// fabricate gaps) but nothing is dispatched, counted, or replied; SetFeeds(true)
-// resumes the SAME session seamlessly.
-func TestFeedsGateFreeze(t *testing.T) {
+// TestSweepRosterOnePassFlow pins the v2 one-pass roster end to end over the
+// real wire: hello carries the (empty) roster push (fail-closed), SetSweeps
+// pushes the full ticker-only roster, the edge's sweep_done retires exactly
+// its ticker and re-pushes the shrunken roster (a later hello can never
+// resurrect a retired pass), the heartbeat's sweepActive marks rows as
+// actually sweeping, and the kill pushes empty.
+func TestSweepRosterOnePassFlow(t *testing.T) {
+	sink := newFakeSink()
+	// pin the clock inside the sweep window — the ET window must not make
+	// this test time-of-day dependent (it fired "blocked until 08:15 ET" on
+	// an evening run)
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, ET())
+	core := NewCore(sink, nil, Config{
+		FlushEvery: 5 * time.Millisecond,
+		Now:        func() time.Time { return now },
+	}, nil)
+	srv, err := Listen("127.0.0.1:0", core, nil, nil)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	c := dial(t, srv.Addr().String())
+	c.send(TypeHello, Hello{Instance: "sweep-onepass"})
+	if rep := c.readReply(); rep.Type != TypeWelcome {
+		t.Fatalf("hello reply = %s, want welcome", rep.Type)
+	}
+	// hello itself answers with the empty roster push — nothing is armed
+	rep := c.readOne()
+	if rep.Type != TypeSweepSet {
+		t.Fatalf("post-hello push = %s, want sweep_set", rep.Type)
+	}
+	var empty SweepSet
+	if err := json.Unmarshal(rep.Data, &empty); err != nil || len(empty.Tickers) != 0 {
+		t.Fatalf("hello roster push not empty: %s %v", rep.Data, err)
+	}
+
+	if err := srv.SetSweeps([]string{"VIX", "TSLA"}); err != nil {
+		t.Fatalf("SetSweeps: %v", err)
+	}
+	rep = c.readOne()
+	if rep.Type != TypeSweepSet {
+		t.Fatalf("roster push = %s, want sweep_set", rep.Type)
+	}
+	if strings.Contains(string(rep.Data), "interval") {
+		t.Fatalf("v2 sweep_set still carries intervals: %s", rep.Data)
+	}
+	var set SweepSet
+	if err := json.Unmarshal(rep.Data, &set); err != nil {
+		t.Fatalf("sweep_set payload: %v", err)
+	}
+	if len(set.Tickers) != 2 || set.Tickers[0].Ticker != "VIX" || set.Tickers[1].Ticker != "TSLA" {
+		t.Fatalf("roster = %+v, want [VIX TSLA]", set.Tickers)
+	}
+
+	// the edge completes VIX's pass: sweep_done(ok) retires VIX only and
+	// re-pushes the shrunken roster
+	c.send(TypeSweepDone, SweepDone{Ticker: "VIX", Ok: true, Requested: 14})
+	rep = c.readOne()
+	if rep.Type != TypeSweepSet {
+		t.Fatalf("post-done push = %s, want sweep_set", rep.Type)
+	}
+	var shrunk SweepSet
+	if err := json.Unmarshal(rep.Data, &shrunk); err != nil || len(shrunk.Tickers) != 1 || shrunk.Tickers[0].Ticker != "TSLA" {
+		t.Fatalf("shrunken roster = %s (%v)", rep.Data, err)
+	}
+
+	// view: VIX retired with a lastPass stamp, TSLA pending AND sweeping
+	// (heartbeat truth), an unobserved ticker gets no estimates
+	c.send(TypeStatus, StatusEvent{Connected: true, SweepActive: []string{"TSLA"}})
+	var view SweepsView
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		view = srv.SweepsView([]string{"VIX", "TSLA", "SPY"}, MasterLogInfo{}, time.Now())
+		if sweepRowOf(view, "TSLA").Sweeping {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	vix, tsla, spy := sweepRowOf(view, "VIX"), sweepRowOf(view, "TSLA"), sweepRowOf(view, "SPY")
+	if vix.Pending || vix.LastPassMs == 0 {
+		t.Fatalf("vix row after sweep_done = %+v", vix)
+	}
+	if !tsla.Pending || !tsla.Sweeping {
+		t.Fatalf("tsla row = %+v", tsla)
+	}
+	if tsla.Estimate != 1.75 || tsla.EstSeconds <= 0 {
+		t.Fatalf("tsla estimates = %+v", tsla)
+	}
+	if spy.Estimate != 0 || spy.EstSeconds != 0 {
+		t.Fatalf("unobserved ticker must carry no estimates: %+v", spy)
+	}
+
+	// kill pill: the empty roster reaches the edge; a late abort sweep_done
+	// for a ticker no longer in the roster is tolerated (logged, no crash)
+	srv.ClearSweeps()
+	rep = c.readOne()
+	if rep.Type != TypeSweepSet {
+		t.Fatalf("kill push = %s, want sweep_set", rep.Type)
+	}
+	if string(rep.Data) == "" || !strings.Contains(string(rep.Data), `"tickers":[]`) {
+		t.Fatalf("kill push not an empty roster: %s", rep.Data)
+	}
+	c.send(TypeSweepDone, SweepDone{Ticker: "TSLA", Ok: false, Reason: "aborted"})
+	time.Sleep(50 * time.Millisecond)
+	if roster := srv.SweepRoster(); len(roster) != 0 {
+		t.Fatalf("roster after kill = %+v, want empty", roster)
+	}
+}
+
+func sweepRowOf(v SweepsView, ticker string) SweepRow {
+	for _, r := range v.Rows {
+		if r.Ticker == ticker {
+			return r
+		}
+	}
+	return SweepRow{}
+}
+
+// TestSweepValidationAndWindows: over-cap rosters are refused (the operator
+// reason rides the 409 body), closed windows are refused per ticker, and the
+// sticky shutoff retires an in-flight pass when its window closes.
+func TestSweepValidationAndWindows(t *testing.T) {
+	sink := newFakeSink()
+	// Saturday 2026-10-03 12:00 ET: every window closed; Thursday
+	// 2026-10-01 is a normal weekday (all-tickers 08:15–18:30, SPX/NDX
+	// 09:20–16:09:59).
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, ET())
+	core := NewCore(sink, nil, Config{
+		FlushEvery: 5 * time.Millisecond,
+		Now:        func() time.Time { return now },
+	}, nil)
+	srv, err := Listen("127.0.0.1:0", core, nil, nil)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	// weekend: refused with the operator reason, roster untouched
+	err = srv.SetSweeps([]string{"TSLA"})
+	var se *SweepError
+	if !errors.As(err, &se) || se.Reason != "weekend — sweeps blocked" {
+		t.Fatalf("weekend refusal = %v", err)
+	}
+	if roster := srv.SweepRoster(); len(roster) != 0 {
+		t.Fatalf("roster after refusal = %+v", roster)
+	}
+
+	// cap: three distinct tickers refused even inside the window
+	now = time.Date(2026, 10, 1, 12, 0, 0, 0, ET())
+	err = srv.SetSweeps([]string{"TSLA", "NVDA", "JPM"})
+	if !errors.As(err, &se) || !strings.Contains(se.Reason, "capped at 2") {
+		t.Fatalf("cap refusal = %v", err)
+	}
+
+	// index window is tighter than the equity window: Thursday 16:30 ET —
+	// SPX closed, TSLA open
+	now = time.Date(2026, 10, 1, 16, 30, 0, 0, ET())
+	err = srv.SetSweeps([]string{"SPX"})
+	if !errors.As(err, &se) || !strings.Contains(se.Reason, "closed 16:10 ET") {
+		t.Fatalf("index window refusal = %v", err)
+	}
+	if err := srv.SetSweeps([]string{"TSLA"}); err != nil {
+		t.Fatalf("equity inside window refused: %v", err)
+	}
+
+	// sticky shutoff: 18:30 ET retires the in-flight TSLA pass
+	now = time.Date(2026, 10, 1, 18, 30, 0, 0, ET())
+	if cleared := srv.EnforceSweepWindows(now); len(cleared) != 1 || cleared[0] != "TSLA" {
+		t.Fatalf("sticky clear = %v, want [TSLA]", cleared)
+	}
+	if roster := srv.SweepRoster(); len(roster) != 0 {
+		t.Fatalf("roster after window close = %+v", roster)
+	}
+}
+
+// TestCollectionNeverPauses pins the v2 posture that replaced the feeds
+// freeze: a session streams hello → chain → spot with NO gate in between —
+// data applies continuously (there is no server-side pause path anymore),
+// and no pause/resume push ever arrives on the wire.
+func TestCollectionNeverPauses(t *testing.T) {
 	sink := newFakeSink()
 	srv, _ := newTestServer(t, sink, nil)
 
-	// establish a live session first: hello + chain (the core rejects spots
-	// for unknown tickers, so the ticker must exist before the freeze)
 	c := dial(t, srv.Addr().String())
-	c.send(TypeHello, Hello{Instance: "gate-test"})
+	c.send(TypeHello, Hello{Instance: "always-collect"})
 	if rep := c.readReply(); rep.Type != TypeWelcome {
 		t.Fatalf("hello reply = %s, want welcome", rep.Type)
 	}
@@ -970,77 +1147,15 @@ func TestFeedsGateFreeze(t *testing.T) {
 	if rep := c.readReply(); rep.Type != TypeSubSet {
 		t.Fatalf("chain reply = %s, want sub_set", rep.Type)
 	}
-
-	srv.SetFeeds(false)
-	// the freeze now carries to the edge: exactly one pause push, then the
-	// stream must fall silent (no error replies, no re-sent welcomes)
-	if rep := c.readReply(); rep.Type != TypePause {
-		t.Fatalf("freeze push = %s, want pause", rep.Type)
+	for i := 6600.0; i < 6605; i++ {
+		c.send(TypeSpot, SpotEvent{Ticker: "SPX", Price: i})
 	}
-	c.send(TypeSpot, SpotEvent{Ticker: "SPX", Price: 6600})
-
-	// frozen: the event is neither applied nor counted — probe the
-	// diagnostics counters (socket-level silence is implied: the frozen
-	// path answers nothing but the hello/ping handshake)
-	before := srv.core.Diagnostics().Read().Events
-	time.Sleep(150 * time.Millisecond)
-	if after := srv.core.Diagnostics().Read().Events; after != before {
-		t.Fatalf("events counted while frozen: %d → %d", before, after)
-	}
-
-	gotSpot := sink.hasSpot("SPX")
-	if gotSpot {
-		t.Fatal("spot applied while feeds were frozen")
-	}
-
-	// resume on the SAME session: the resume push lands, then the next
-	// event applies normally
-	srv.SetFeeds(true)
-	if rep := c.readReply(); rep.Type != TypeResume {
-		t.Fatalf("resume push = %s, want resume", rep.Type)
-	}
-	c.send(TypeSpot, SpotEvent{Ticker: "SPX", Price: 6601})
-
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		v := sink.spot("SPX")
-		if v == 6601 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("spot 6601 not applied after resume (got %v)", v)
-		}
+	for time.Now().Before(deadline) && sink.spot("SPX") != 6604 {
 		time.Sleep(5 * time.Millisecond)
 	}
-
-	d := srv.core.Diagnostics().Read()
-	if d.SeqGaps != 0 {
-		t.Fatalf("seq gaps = %d after freeze/resume, want 0 (seq must be observed while frozen)", d.SeqGaps)
-	}
-}
-
-// TestFrozenConnectGetsPaused: a session established while feeds are off is
-// welcomed and immediately told to pause — the edge reaches a stable idle
-// state instead of spinning its reconnect loop against a silent core.
-func TestFrozenConnectGetsPaused(t *testing.T) {
-	sink := newFakeSink()
-	srv, _ := newTestServer(t, sink, nil)
-
-	srv.SetFeeds(false)
-	c := dial(t, srv.Addr().String())
-	c.send(TypeHello, Hello{Instance: "frozen-join"})
-	if rep := c.readReply(); rep.Type != TypeWelcome {
-		t.Fatalf("hello reply = %s, want welcome (handshake must complete while frozen)", rep.Type)
-	}
-	if rep := c.readReply(); rep.Type != TypePause {
-		t.Fatalf("second reply = %s, want pause (frozen session must learn its state)", rep.Type)
-	}
-
-	// and a data event still neither applies nor replies
-	c.send(TypeSpot, SpotEvent{Ticker: "SPX", Price: 6600})
-	gotSpot := sink.hasSpot("SPX")
-	if gotSpot {
-		t.Fatal("spot applied while feeds were frozen")
+	if got := sink.spot("SPX"); got != 6604 {
+		t.Fatalf("spots stopped applying: last = %v, want 6604", got)
 	}
 }
 
@@ -1219,61 +1334,6 @@ func TestSpotSubRegistration(t *testing.T) {
 	}
 }
 
-// TestFeedsGateFreezeSpotOnly pins the freeze verdict from the 2026-09-19
-// smoke review (docs/HANDOFF-2026-09-19.md open item 2): a spot_sub ticker's
-// L1 line — the hedge benchmark path, with no chain of its own — is frozen by
-// SetFeeds(false) exactly like every other inbound event. The live repro
-// (serve --edge-sim, GUI Disconnect, benchSpot pinned while the sim, which
-// ignores pause, kept sending) confirmed the gate already covers it; the
-// "post-disconnect bench advance" observed in the smoke was pre-disconnect
-// streaming — the journal shows the final spot landing 110 ms BEFORE the
-// pause push, which is the last record. This test keeps it that way.
-func TestFeedsGateFreezeSpotOnly(t *testing.T) {
-	sink := newFakeSink()
-	srv, _ := newTestServer(t, sink, nil)
-
-	c := dial(t, srv.Addr().String())
-	c.send(TypeHello, Hello{Instance: "spot-only-freeze"})
-	if rep := c.readReply(); rep.Type != TypeWelcome {
-		t.Fatalf("hello reply = %s, want welcome", rep.Type)
-	}
-	c.sendCorrelated(8001, TypeSpotSub, SpotSub{Ticker: "CIBR"})
-	if rep := c.readReply(); rep.Type != TypeSpotAck {
-		t.Fatalf("spot_sub reply = %s, want spot_ack", rep.Type)
-	}
-	c.send(TypeSpot, SpotEvent{Ticker: "CIBR", Price: 200.24})
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && sink.spot("CIBR") != 200.24 {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := sink.spot("CIBR"); got != 200.24 {
-		t.Fatalf("pre-freeze spot did not apply: %v", got)
-	}
-
-	srv.SetFeeds(false)
-	if rep := c.readReply(); rep.Type != TypePause {
-		t.Fatalf("freeze push = %s, want pause", rep.Type)
-	}
-	c.send(TypeSpot, SpotEvent{Ticker: "CIBR", Price: 201.85})
-	time.Sleep(150 * time.Millisecond)
-	if got := sink.spot("CIBR"); got != 200.24 {
-		t.Fatalf("spot-only ticker advanced while frozen: %v", got)
-	}
-
-	srv.SetFeeds(true)
-	if rep := c.readReply(); rep.Type != TypeResume {
-		t.Fatalf("resume push = %s, want resume", rep.Type)
-	}
-	c.send(TypeSpot, SpotEvent{Ticker: "CIBR", Price: 201.9})
-	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && sink.spot("CIBR") != 201.9 {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := sink.spot("CIBR"); got != 201.9 {
-		t.Fatalf("spot-only ticker did not resume after unfreeze: %v", got)
-	}
-}
-
 // TestSimulatorSpotOnly: the Phase-3 benchmark path through the REAL wire —
 // the sim announces the bench with spot_sub (no chain), walks its L1 spot,
 // and the sink receives it with no chain ever arriving for that ticker.
@@ -1307,6 +1367,23 @@ func TestSimulatorSpotOnly(t *testing.T) {
 	for _, a := range core.Diagnostics().Read().Anomalies {
 		if a.Ticker == "CIBR" {
 			t.Fatalf("benchmark drew an anomaly: %+v", a)
+		}
+	}
+}
+
+// The 2026-10-01 crash pin at the ingest layer: IB delivers "unset" as C#
+// double.MaxValue — finite and positive, it slips past naive >0/NaN/Inf
+// checks and poisoned the live book's ATM math. The wire guard must reject
+// it outright while passing every real underlying price.
+func TestSaneSpotPriceRejectsMaxValue(t *testing.T) {
+	for _, v := range []float64{math.MaxFloat64, -1, 0, math.NaN(), math.Inf(1), math.Inf(-1), 1e9, 1.5e9} {
+		if saneSpotPrice(v) {
+			t.Fatalf("saneSpotPrice(%v) = true, want false", v)
+		}
+	}
+	for _, v := range []float64{0.01, 661.5, 30500, 999_999_999} {
+		if !saneSpotPrice(v) {
+			t.Fatalf("saneSpotPrice(%v) = false, want true", v)
 		}
 	}
 }

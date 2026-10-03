@@ -49,6 +49,10 @@ type Config struct {
 	FlipEvery   time.Duration // engine zero-gamma cadence (default 5s)
 	TickEvery   time.Duration // sim cadence while connected (default 1s)
 	HistCap     int           // in-memory ΔGEX history length per ticker (default 3600)
+	// WatchlistFile replaces the compiled default watchlist with a JSON
+	// config file ({"tickers": [...]}); empty = DefaultWatchlist. The start
+	// script reads the same file for the edge's --tickers.
+	WatchlistFile string
 	// LiveBlend enables the design-2 vol surface in every ticker engine
 	// (quoted-IV skew overlay on the GARCH/flat anchor; internal/volblend).
 	LiveBlend bool
@@ -60,6 +64,11 @@ type Config struct {
 	Now        func() time.Time
 	Logger     func(string, ...any)
 }
+
+// PersistEvery is the live-session DB checkpoint cadence (2026-10-01: 5
+// minutes, the operator's call — the journal keeps every wire line for
+// replay regardless, and Disconnect/shutdown always persist in full).
+const PersistEvery = 5 * time.Minute
 
 func (c Config) withDefaults() Config {
 	if c.LevelsEvery <= 0 {
@@ -121,11 +130,9 @@ type Service struct {
 	closed      bool
 	// externalFeed set by UseExternalFeed: an edge server or replay owns the
 	// data streams, so connecting must not start the built-in synthetic sim.
+	// GUI connect/disconnect is VIEW-ONLY for an external feed — the edge
+	// keeps streaming and ingest keeps applying/journaling regardless.
 	externalFeed bool
-	// feedGate set by SetExternalFeedGate: freezes/resumes the external feed
-	// itself when the GUI connects/disconnects — with an edge feed owned by
-	// another process, stream switches alone change nothing on the wire.
-	feedGate func(on bool)
 
 	// hedge module state (Phase 2, architecture.md §12) — guarded by mu
 	hedgeAsset   string
@@ -168,8 +175,17 @@ func New(cfg Config) (*Service, error) {
 		s.str = str
 	}
 
-	// watchlist = defaults (in order) + one custom slot
+	// watchlist = config file (when given) or defaults (in order) + one
+	// custom slot
 	entries := DefaultWatchlist()
+	if cfg.WatchlistFile != "" {
+		loaded, err := WatchlistFromFile(cfg.WatchlistFile)
+		if err != nil {
+			s.Close()
+			return nil, err
+		}
+		entries = loaded
+	}
 	customSet := false
 	if cfg.Custom != "" {
 		if !ValidTicker(cfg.Custom) {
@@ -460,7 +476,7 @@ func (s *Service) startEngineLocked(ticker string) {
 
 // publish forwards changed engine snapshots to history and subscribers. Every
 // ticker's history advances; only the active ticker's full state is broadcast.
-// While live it also checkpoints state to the store every ~30 s.
+// While live it also checkpoints state to the store every PersistEvery (5m).
 func (s *Service) publish() {
 	s.mu.Lock()
 	active := s.active
@@ -484,7 +500,7 @@ func (s *Service) publish() {
 			changed = n > 0 && h.hist[n-1].T == snap.AsOfMs
 		}
 	}
-	if s.connectedLocked() && s.cfg.Now().Sub(s.lastPersist) > 30*time.Second {
+	if s.connectedLocked() && s.cfg.Now().Sub(s.lastPersist) > PersistEvery {
 		s.saveStateLocked() // crash checkpoint; lastPersist stamps inside
 	}
 	if s.hedgeAsset != "" {
@@ -594,7 +610,9 @@ func (s *Service) ActiveTicker() string {
 // SetStream connects or disconnects one stream ("underlying", "options") or
 // all of them ("all"). Disconnecting the last connected stream freezes every
 // book in memory and saves each ticker's state to the store, so the GUI keeps
-// rendering charts from saved data with no live feed.
+// rendering charts from saved data. With an external feed this is the GUI's
+// VIEW state only — collection continues, and stopping sweeps is a separate
+// concern (the httpui layer kills the roster on disconnect).
 func (s *Service) SetStream(id StreamID, on bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -609,7 +627,6 @@ func (s *Service) SetStream(id StreamID, on bool) error {
 	if id == StreamAll {
 		ids = []StreamID{StreamUnderlying, StreamOptions}
 	}
-	wasConnected := s.connectedLocked()
 	for _, one := range ids {
 		s.streams[one] = on
 	}
@@ -623,7 +640,9 @@ func (s *Service) SetStream(id StreamID, on bool) error {
 		s.stopSimLocked()
 		// Freeze the engine output at the final book state so the saved
 		// snapshot is exactly what the UI keeps showing — no last-tick race
-		// between the async recompute cadence and the persist.
+		// between the async recompute cadence and the persist. This is the
+		// GUI's VIEW state only: with an external feed the edge keeps
+		// streaming and ingest keeps applying/journaling regardless.
 		for _, t := range s.order {
 			if h := s.handles[t]; h != nil {
 				h.eng.RecomputeLevels()
@@ -635,25 +654,14 @@ func (s *Service) SetStream(id StreamID, on bool) error {
 
 	status := s.statusLocked(s.active)
 	s.hub.Broadcast("status", status)
-
-	// External feed: drive the gate ONLY on connected↔disconnected
-	// transitions — single-stream toggles keep the feed running while any
-	// stream is still connected. The gate must be non-blocking — it's called
-	// under the service mutex.
-	if connected := s.connectedLocked(); s.externalFeed && s.feedGate != nil && connected != wasConnected {
-		s.feedGate(connected)
-	}
 	return nil
 }
 
-// SetExternalFeedGate registers the freeze/resume control for an external
-// feed owner (the edge server). Called by the serve wiring; the gate is
-// driven by SetStream and must not block.
-func (s *Service) SetExternalFeedGate(gate func(on bool)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.feedGate = gate
-}
+// (v2 note) The external-feed freeze gate is gone: a GUI Disconnect used to
+// pause the edge and freeze ingest so nothing billed while nobody watched,
+// but sweeps are on-demand now — collection (edge ingest, journal, db, master
+// CSV) runs continuously regardless of GUI state, and only the GUI's sweep
+// controls (Stop/kill pill/Disconnect) stop a pass.
 
 func (s *Service) connectedLocked() bool {
 	return s.streams[StreamUnderlying] || s.streams[StreamOptions]

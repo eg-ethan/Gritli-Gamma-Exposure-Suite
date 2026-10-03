@@ -452,6 +452,15 @@ func blendedVols(in BookInputs, multiClass bool) []float64 {
 				bestD, best = d, strikes[k]
 			}
 		}
+		if best == nil {
+			// unreachable for sane spots (the first key always wins against
+			// bestD=MaxFloat64) — but a poisoned spot exactly at ±MaxFloat64
+			// makes every |k−spot| round back to MaxFloat64 and no comparison
+			// ever passes (live 2026-10-01: an unset TWS price arrived as C#
+			// double.MaxValue and crashed the core). Skip the group like a
+			// no-quotes expiry; bad data never takes the process down.
+			continue
+		}
 		atm[key] = atmRef{iv: best.sumIV / float64(best.n), quote: volblend.Quote{Bid: best.bid, Ask: best.ask, OK: best.ok}}
 	}
 

@@ -4,10 +4,14 @@ The IBKR-facing half of the GEX suite (architecture.md §1: C# only for the
 layer that talks to TWS / IB Gateway). Everything else — selection math, the
 exposure engine, persistence, the GUI — lives in the Go core.
 
-**Cost posture & sweeps:** `--no-sweep` (rotation-only, zero snapshots) is
-the recommended default. Snapshot sweeps refresh index books faster, but each
-snapshot is metered at about $0.01, so `--no-sweep` trades data freshness for
-zero snapshot spend.
+**Cost posture & sweeps (v2):** nothing ever sweeps at boot. The only chain
+snapshots the edge fires are ONE-PASS, GUI-initiated ("Run 1 pass" per
+ticker in the core's Snapshot Sweeper panel, max 2 in flight) — each pass
+covers the ticker's filtered chain once (~$0.01 per snapshot), then stops by
+itself. `--no-sweep`/`--sweep-seconds` are accepted as deprecated no-ops.
+Collection (L1 spot lines, OI rotation, vendor OI) runs continuously
+regardless of GUI state; the GUI's Disconnect aborts in-flight passes but
+never stops collection.
 
 **Status: builds and runs against live TWS.** The .NET 8 SDK is installed
 (8.0.424, 2026-09-08); simulate mode is proven end-to-end against the core,
@@ -57,28 +61,34 @@ gex-edge --core 127.0.0.1:7878 --tws 127.0.0.1:7496 --client-id 11 --tickers SPX
 | `--hedge-bench SYM` | hedge-module benchmark: a spot-only ticker — one permanent L1 line, no chain discovery, no sweeps, no OI rotation (register-then-stream; see below) |
 | `--simulate` | deterministic feed instead of TWS — no credentials |
 | `--seed`, `--interval-ms` | simulator knobs |
-| `--sweep-inflight` | bounded in-flight snapshot requests, account-wide (default 6; the 50 msg/s pacer still caps the wire) |
-| `--sweep-seconds` | pause between snapshot sweeps (default 45) |
+| `--sweep-inflight` | bounded in-flight snapshot requests during a one-pass sweep, account-wide (default 6; the 50 msg/s pacer still caps the wire) |
+| `--no-sweep` | deprecated no-op (v2): boot never sweeps — kept so old scripts run |
+| `--sweep-seconds` | deprecated no-op (v2): one-pass sweeps have no cadence |
 | `--oi-lines` | streaming lines leased at a time by the OI rotation (default 40; 0 disables — OI rides only streaming subscriptions) |
 | `--oi-hold-seconds` | how long each OI rotation batch stays subscribed (default 30) |
 | `--instance` | instance name in the hello handshake (diagnostics) |
 
-## Snapshot sweeps
+## One-pass snapshot sweeps (v2)
 
 Option chains select far more contracts than a 100-line streaming budget
-covers (SPX ≈ 1,000–1,500 after the 2SD filter), so EVERY ticker — index or
-equity — runs **snapshot sweeps**: `reqMktData(..., snapshot:true)` with
-generic ticks `106,13`, paced through the shared 50 msg/s pacer with
-`--sweep-inflight` requests in flight (account-wide) and re-swept every
-`--sweep-seconds`. Snapshots occupy a TWS line WHILE IN FLIGHT
-(they reject generic ticks outright — 321), so the sweep's in-flight slot
-travels with each snapshot until `tickSnapshotEnd` (30s watchdog for
-refusals), sharing the `LineAccountant` budget with everything else. The
-~$0.01 snapshot cost is accounted by `ChargeSnapshot` on the status
-heartbeat. Snapshots land in the identical `optcomp` normalization path —
-the core cannot tell a swept book from a streamed one. The sweep-vs-rotation
-tradeoff, cost tables, and the `--no-sweep` recommendation live in
-`SWEEP_HANDOFF.md`.
+covers (SPX ≈ 1,000–1,500 after the 2SD filter), so the book refreshes on
+demand: the core pushes a `sweep_set` roster (the FULL in-flight set —
+empty aborts everything, pushed on every hello so a fresh core stops a
+stale edge) and the edge runs exactly ONE `reqMktData(..., snapshot:true)`
+pass per listed ticker over its filtered chain — generic ticks `106,13`,
+paced through the shared 50 msg/s pacer with `--sweep-inflight` requests in
+flight (account-wide), reported done via `sweep_done` (never re-armed). The
+edge re-clamps the 2-ticker cap and re-checks the ET windows itself
+(`SweepPolicy.cs`, mirroring the Go policy) — it is the billing process and
+trusts nothing. Snapshots occupy a TWS line WHILE IN FLIGHT (they reject
+generic ticks outright — 321), so the in-flight slot travels with each
+snapshot until `tickSnapshotEnd` (30s watchdog for refusals), sharing the
+`LineAccountant` budget with everything else. The ~$0.01 snapshot cost is
+accounted by `ChargeSnapshot` on the status heartbeat, and the optcomp
+events stamp `src: snap|stream` so the master log's Source column is
+truthful. Pass costs and the sweep-vs-rotation tradeoff live in
+`SWEEP_HANDOFF.md` (per-ticker table §4: TSLA/NVDA ≈ $1.75–1.82 a click,
+VIX ≈ $0.15, SPX ≈ $10.44).
 
 ## Open interest
 

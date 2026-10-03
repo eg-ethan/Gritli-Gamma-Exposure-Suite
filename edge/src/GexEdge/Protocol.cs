@@ -1,9 +1,13 @@
 // GEX Edge — wire protocol types (the C# side of internal/edge/proto.go).
 //
-// Protocol v1: newline-delimited JSON over localhost TCP. Envelope shape and
+// Protocol v2: newline-delimited JSON over localhost TCP. Envelope shape and
 // message set mirror architecture.md §5 table-for-table; the Go core is the
 // authority (see core/internal/edge/proto.go and docs/_verify/
 // edge_protocol_conformance.py — the third-language conformance check).
+//
+// v2 renamed the sweep roster to one-pass semantics (SweepEntry lost
+// intervalSeconds) and added sweep_done; both sides gate on the version so a
+// mixed core/edge pair is rejected loudly, never silently ignored.
 //
 // Every outbound message carries a per-connection monotonic Seq starting at
 // 1; the core gap-detects on it. Chain events carry an Id the sub_set reply
@@ -16,7 +20,7 @@ namespace GexEdge;
 
 public sealed class Envelope
 {
-    [JsonPropertyName("v")] public int V { get; set; } = 1;
+    [JsonPropertyName("v")] public int V { get; set; } = 2;
     [JsonPropertyName("seq")] public long Seq { get; set; }
     [JsonPropertyName("type")] public string Type { get; set; } = "";
     [JsonPropertyName("ts")] public long Ts { get; set; }
@@ -98,6 +102,10 @@ public sealed class OptComp
     [JsonPropertyName("gamma")] public double Gamma { get; set; }
     [JsonPropertyName("vega")] public double Vega { get; set; }
     [JsonPropertyName("theta")] public double Theta { get; set; }
+    // collection path at the source ("snap" = a GUI-armed one-pass snapshot,
+    // "stream" = the OI rotation's streaming line) so the permanent
+    // Data_Points log's Source column is truthful; null streams as omitted
+    [JsonPropertyName("src")] public string? Src { get; set; }
 }
 
 public sealed class SpotEvent
@@ -122,11 +130,41 @@ public sealed class StatusEvent
     [JsonPropertyName("msgRate")] public double MsgRate { get; set; }
     [JsonPropertyName("snapshotSpend")] public double SnapshotSpend { get; set; }
     [JsonPropertyName("connected")] public bool Connected { get; set; }
+    // tickers with a live one-pass sweep right now — the metered truth the
+    // GUI renders, not the roster intent
+    [JsonPropertyName("sweepActive")] public string[]? SweepActive { get; set; }
+}
+
+/// One ticker whose single pass the core requests (v2: no interval — the
+/// entry IS the request; the edge fires one full-chain pass and answers
+/// with SweepDone).
+public sealed class SweepEntry
+{
+    [JsonPropertyName("ticker")] public string Ticker { get; set; } = "";
+}
+
+/// The sweep_set payload: the FULL in-flight roster, not a delta (an empty
+/// set aborts everything).
+public sealed class SweepSet
+{
+    [JsonPropertyName("tickers")] public List<SweepEntry> Tickers { get; set; } = [];
+}
+
+/// The sweep_done payload: the outcome of ONE roster pass — ok = completed
+/// over the filtered chain; !ok + Reason = aborted (kill/pause cleared the
+/// roster) or refused (window closed at the edge, ticker not covered,
+/// discovery incomplete).
+public sealed class SweepDone
+{
+    [JsonPropertyName("ticker")] public string Ticker { get; set; } = "";
+    [JsonPropertyName("ok")] public bool Ok { get; set; }
+    [JsonPropertyName("reason")] public string? Reason { get; set; }
+    [JsonPropertyName("requested")] public int Requested { get; set; }
 }
 
 public static class Wire
 {
-    public const int ProtocolVersion = 1;
+    public const int ProtocolVersion = 2;
 
     private static readonly JsonSerializerOptions Json = new()
     {

@@ -109,6 +109,11 @@ type Core struct {
 	logErrs    []<-chan error
 	pointErrs  []<-chan error
 	lastStatus *StatusEvent
+	// sweepDoneHook is the Server's roster hook (set by Listen; nil under
+	// replay, where there is no roster to clear). Called with the decoded,
+	// shape-validated sweep_done — roster bookkeeping is the server's, not
+	// the book's.
+	sweepDoneHook func(SweepDone)
 }
 
 // tickerIngest is one underlying's working chain: the filtered skeleton from
@@ -326,6 +331,12 @@ func (c *Core) Dispatch(sess *Session, env Envelope) []Outbound {
 			return nil
 		}
 		return c.onSpotSub(sess, env)
+	case TypeSweepDone:
+		if !c.requireHello(sess, env) {
+			return nil
+		}
+		c.onSweepDone(sess, env)
+		return nil
 	case TypeTrade, TypeDepth:
 		if !c.requireHello(sess, env) {
 			return nil
@@ -607,6 +618,24 @@ func (c *Core) LastStatus() *StatusEvent {
 	return c.lastStatus
 }
 
+// onSweepDone decodes and shape-checks one pass outcome, then hands it to
+// the Server's roster hook (nil under journal replay — there is no live
+// roster to clear there). The envelope itself was already counted and
+// journaled on the shared dispatch path.
+func (c *Core) onSweepDone(sess *Session, env Envelope) {
+	var ev SweepDone
+	if err := json.Unmarshal(env.Data, &ev); err != nil || !validSpotTicker(ev.Ticker) {
+		c.diag.rejectedOne()
+		c.diag.anomaly(AnomalyMalformed, "", 0,
+			fmt.Sprintf("bad sweep_done from %s", sess.Remote))
+		return
+	}
+	ev.Ticker = strings.ToUpper(ev.Ticker)
+	if c.sweepDoneHook != nil {
+		c.sweepDoneHook(ev)
+	}
+}
+
 // onSpotSub registers a spot-only ticker (the hedge benchmark, spec §3): L1
 // spot will arrive with no chain, no discovery, no sub_set. Idempotent; a
 // later chain event for the same ticker is independent and fine.
@@ -638,8 +667,16 @@ func validSpotTicker(t string) bool {
 	return true
 }
 
+// saneSpotPrice bounds a usable underlying price (mirrors market's book
+// guard): IB's "unset" marker is double.MaxValue — finite, positive, poison.
+func saneSpotPrice(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0 && v < 1e9
+}
+
 // onSpot applies an underlying tick immediately (cheap; keeps the book's
-// spot fresher than the chain-flush cadence).
+// spot fresher than the chain-flush cadence). The sanity bound mirrors the
+// book's: IB delivers "unset" as double.MaxValue, which is finite and > 0 —
+// it must never reach a chain.
 func (c *Core) onSpot(sess *Session, env Envelope) {
 	var ev SpotEvent
 	if err := json.Unmarshal(env.Data, &ev); err != nil {
@@ -648,7 +685,7 @@ func (c *Core) onSpot(sess *Session, env Envelope) {
 	}
 	c.mu.Lock()
 	ti, known := c.tickers[ev.Ticker]
-	if known && ev.Price > 0 { // keep the working chain's spot in step with the book
+	if known && saneSpotPrice(ev.Price) { // keep the working chain's spot in step with the book
 		ti.chain.Spot = ev.Price
 		ti.chain.AsOfMs = maxI64(ti.chain.AsOfMs, env.TS)
 	}
@@ -657,6 +694,12 @@ func (c *Core) onSpot(sess *Session, env Envelope) {
 	if !known && !spotOnly {
 		c.diag.rejectedOne()
 		c.diag.anomaly(AnomalyUnknownTicker, ev.Ticker, 0, "spot before chain discovery")
+		return
+	}
+	if !saneSpotPrice(ev.Price) {
+		// IB's "unset" marker (double.MaxValue) is finite and positive —
+		// reject it here rather than letting the book error on every tick
+		c.diag.rejectedOne()
 		return
 	}
 	if err := c.sink.ApplySpot(context.Background(), ev.Ticker, ev.Price, env.TS); err != nil {
@@ -758,9 +801,10 @@ func (c *Core) onOptComp(sess *Session, env Envelope) {
 	if o.OpenInterest > 0 {
 		e.OpenInterest = o.OpenInterest
 	}
-	if o.UndPrice > 0 && o.UndPrice != ti.chain.Spot {
+	if o.UndPrice > 0 && o.UndPrice < 1e9 && o.UndPrice != ti.chain.Spot {
 		// optcomp carries the exchange's undPrice; trust the dedicated spot
-		// stream for the book but keep the working copy coherent
+		// stream for the book but keep the working copy coherent. The < 1e9
+		// bound rejects IB's double.MaxValue "unset" marker.
 		ti.chain.Spot = o.UndPrice
 	}
 	ti.pending = true

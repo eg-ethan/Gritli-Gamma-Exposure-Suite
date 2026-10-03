@@ -28,9 +28,14 @@ public sealed class CoreConnection : IAsyncDisposable
     public Action<Envelope>? OnMessage { get; set; }
     public Action<Exception>? OnError { get; set; }
 
-    // the core's GUI-disconnect backpressure: pause = stop all TWS-side
-    // requesting (the snapshot meter must not run behind a frozen GUI);
-    // resume = re-subscribe. Fires from the reader thread.
+    // the core's one-pass sweep roster (full set semantics — an empty set
+    // aborts every in-flight pass). Fires from the reader thread.
+    public Action<SweepSet>? OnSweepSet { get; set; }
+
+    // (v2) pause/resume are defensive dead code — no core path sends them
+    // anymore (collection runs continuously; stopping sweeps goes through
+    // the roster). Honored if one ever arrives: the feed aborts in-flight
+    // passes cleanly.
     public Action? OnPause { get; set; }
     public Action? OnResume { get; set; }
 
@@ -153,6 +158,9 @@ public sealed class CoreConnection : IAsyncDisposable
                     if (_pending.TryRemove(env.Id ?? 0, out var tcs))
                         tcs.TrySetResult(sub);
                     OnSubSet?.Invoke(sub);
+                    break;
+                case "sweep_set":
+                    OnSweepSet?.Invoke(Wire.Data<SweepSet>(env));
                     break;
                 case "error":
                     OnError?.Invoke(new EdgeProtocolException(Wire.Data<ErrorMsg>(env).Message));

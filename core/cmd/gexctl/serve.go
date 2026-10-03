@@ -43,11 +43,25 @@ func customSuffix(custom string) string {
 	return " + " + strings.ToUpper(custom)
 }
 
+// watchlistNames renders the served coverage set for the startup banner —
+// whatever DefaultWatchlist or the --watchlist file produced, never a
+// hardcoded list (the 2026-10-01 NDX→QQQ swap left the banner stale).
+func watchlistNames(svc *app.Service) string {
+	names := make([]string, 0, 9)
+	for _, e := range svc.Watchlist() {
+		if !e.Custom { // the free slot rides the banner's custom suffix
+			names = append(names, e.Ticker)
+		}
+	}
+	return strings.Join(names, " ")
+}
+
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:8787", "listen address (keep localhost: the API has no auth)")
 	dbPath := fs.String("db", "gex.db", "path to the SQLite database file (empty = in-memory only)")
-	custom := fs.String("ticker", "", "seed for the free watchlist slot (e.g. AAPL); the defaults SPX/NDX/VIX/TSLA/NVDA/SOXX/GOOG/JPM are always served")
+	custom := fs.String("ticker", "", "seed for the free watchlist slot (e.g. AAPL); the defaults SPX/QQQ/VIX/TSLA/NVDA/SOXX/GOOG/JPM are always served")
+	watchlistFile := fs.String("watchlist", "", "JSON watchlist config that replaces the compiled defaults ({\"tickers\":[\"SPX\",\"QQQ\",…]}); the start script reads the same file for the edge's --tickers")
 	var seed uint64
 	fs.Uint64Var(&seed, "seed", 42, "simulator RNG seed")
 	connect := fs.Bool("connect", false, "connect the data streams immediately at startup")
@@ -55,7 +69,7 @@ func cmdServe(args []string) error {
 	edgeSim := fs.Bool("edge-sim", false, "also connect the built-in deterministic edge simulator to --edge-addr (no TWS needed); implies --connect")
 	journalPath := fs.String("journal", "", "record the edge session to this JSONL journal for later `gexctl replay`")
 	oiVendor := fs.String("oi-vendor", "cboe", "vendor open-interest source for TWS accounts whose feed delivers no option OI — patches CBOE delayed OI onto live books (\"cboe\" or \"none\")")
-	masterCsv := fs.String("master-csv", "", "master data CSV every collected data point appends to every 30 min (empty = master_data.csv next to the DB; no DB = off)")
+	masterCsv := fs.String("master-csv", "", "master data CSV every collected data point appends to every 5 min (empty = master_data.csv next to the DB; no DB = off)")
 	allowHosts := fs.String("allow-host", "", "comma-separated extra hostnames/IPs the GUI accepts in Host/Origin headers (localhost is always allowed; the API still has no auth)")
 	hedgeAsset := fs.String("hedge-asset", "", "hedge module asset — must be a watchlist ticker (needs a chain); seeds the pair, a stored pair wins")
 	hedgeBench := fs.String("hedge-bench", "", "hedge module benchmark — spot-only ticker (ETF-preferred); seeds the pair, a stored pair wins")
@@ -64,9 +78,10 @@ func cmdServe(args []string) error {
 	svc, err := app.New(app.Config{
 		Custom: strings.ToUpper(*custom),
 		Seed:   seed, DBPath: *dbPath,
-		LiveBlend:  true,
-		HedgeAsset: strings.ToUpper(*hedgeAsset),
-		HedgeBench: strings.ToUpper(*hedgeBench),
+		WatchlistFile: *watchlistFile,
+		LiveBlend:     true,
+		HedgeAsset:    strings.ToUpper(*hedgeAsset),
+		HedgeBench:    strings.ToUpper(*hedgeBench),
 	})
 	if err != nil {
 		return err
@@ -113,10 +128,10 @@ func cmdServe(args []string) error {
 	}
 	if stack != nil {
 		edgeDiag := stack.core.Diagnostics()
-		// the GUI's Disconnect must stop an external feed, not just the
-		// built-in synthetic sim — drive the server's dispatch gate from
-		// the stream switches
-		svc.SetExternalFeedGate(stack.srv.SetFeeds)
+		// (v2) no feed gate: the edge streams and collection runs continuously
+		// regardless of GUI state — the GUI's Disconnect stops sweeps (the
+		// httpui streams handler kills the roster) and drops its live view,
+		// nothing more.
 		st := svc.Store()
 		srv.SetDiagnostics(func() any {
 			out := struct {
@@ -149,7 +164,7 @@ func cmdServe(args []string) error {
 				}
 				return stack.srv.SweepsView(tickers, ml, time.Now())
 			},
-			Apply: func(entries []edge.SweepEntry) error { return stack.srv.SetSweeps(entries) },
+			Apply: func(tickers []string) error { return stack.srv.SetSweeps(tickers) },
 			Kill:  func() error { stack.srv.ClearSweeps(); return nil },
 		})
 	}
@@ -192,8 +207,8 @@ func cmdServe(args []string) error {
 	go func() { errCh <- httpSrv.ListenAndServe() }()
 
 	url := fmt.Sprintf("http://%s", *addr)
-	fmt.Printf("GEX Suite running at %s  (watchlist SPX NDX VIX TSLA NVDA SOXX GOOG JPM%s, db %s)\n",
-		url, customSuffix(*custom), *dbPath)
+	fmt.Printf("GEX Suite running at %s  (watchlist %s%s, db %s)\n",
+		url, watchlistNames(svc), customSuffix(*custom), *dbPath)
 	if masterPath != "" {
 		fmt.Printf("master data log: %s (Data_Points → CSV every %s, wall-clock aligned)\n",
 			masterPath, edge.MasterLogFlushEvery)
@@ -236,8 +251,8 @@ func journalDisplay(p string) string {
 }
 
 // runMasterLogExporter appends all not-yet-exported Data_Points rows to the
-// master CSV every MasterLogFlushEvery, wall-clock aligned (:00/:30 at the
-// default 30m). A final pass on shutdown keeps the CSV near-current; an
+// master CSV every MasterLogFlushEvery, wall-clock aligned (:00/:05/… at the
+// default 5m). A final pass on shutdown keeps the CSV near-current; an
 // interrupted append re-appends on the next pass — never skips.
 func runMasterLogExporter(ctx context.Context, st *store.Store, path string) {
 	export := func(final bool) {

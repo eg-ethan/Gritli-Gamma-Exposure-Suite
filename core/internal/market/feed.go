@@ -44,6 +44,16 @@ func NewInMemoryBook() *InMemoryBook {
 	return &InMemoryBook{books: make(map[string]*BookState)}
 }
 
+// saneSpot bounds a usable underlying price: finite, positive, and below the
+// "unset marker" magnitudes. IB's API delivers unavailable values as
+// double.MaxValue (≈1.8e308) — a perfectly finite float that passes naive
+// >0/NaN/Inf checks and, at that magnitude, makes every |strike − spot|
+// round straight back to MaxFloat64 (the 2026-10-01 blendedVols nil-deref
+// crash). No real underlying trades at $1e9.
+func saneSpot(v float64) bool {
+	return finite(v) && v > 0 && v < 1e9
+}
+
 // ApplyChainSnapshot validates and stores a full chain view, replacing any
 // previous chain for the ticker (a chain snapshot is a full replace, not a
 // delta — architecture.md §3 snapshot sweeps).
@@ -51,7 +61,7 @@ func (b *InMemoryBook) ApplyChainSnapshot(ctx context.Context, snap ChainSnapsho
 	if snap.Ticker == "" {
 		return fmt.Errorf("%w: empty ticker", ErrInvalidSnapshot)
 	}
-	if !finite(snap.Spot) || snap.Spot <= 0 {
+	if !saneSpot(snap.Spot) {
 		return fmt.Errorf("%w: ticker %s spot %v", ErrInvalidSnapshot, snap.Ticker, snap.Spot)
 	}
 	for i := range snap.Contracts {
@@ -59,7 +69,7 @@ func (b *InMemoryBook) ApplyChainSnapshot(ctx context.Context, snap ChainSnapsho
 			return err
 		}
 		// chain-level routing metadata fills per-contract gaps (the edge
-		// discovers the exchange/underlying type once per chain, not per leg)
+		// discovers the underlying once per chain, not per leg)
 		if snap.Contracts[i].Exchange == "" && snap.Exchange != "" {
 			snap.Contracts[i].Exchange = snap.Exchange
 		}
@@ -78,7 +88,7 @@ func (b *InMemoryBook) ApplySpot(ctx context.Context, ticker string, spot float6
 	if ticker == "" {
 		return fmt.Errorf("%w: empty ticker", ErrInvalidSnapshot)
 	}
-	if !finite(spot) || spot <= 0 {
+	if !saneSpot(spot) {
 		return fmt.Errorf("%w: ticker %s spot %v", ErrInvalidSnapshot, ticker, spot)
 	}
 	b.mu.Lock()

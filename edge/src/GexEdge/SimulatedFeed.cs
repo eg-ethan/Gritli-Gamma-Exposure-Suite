@@ -9,6 +9,8 @@
 // exact numbers differ from the Go simulator on purpose — two independent
 // implementations agreeing on the protocol is the point.
 
+using System.Collections.Concurrent;
+
 namespace GexEdge;
 
 public sealed class SimulatedFeed
@@ -27,6 +29,41 @@ public sealed class SimulatedFeed
         _interval = interval;
         _rng = new Random(seed);
         _bench = bench;
+    }
+
+    // ── one-pass sweep mirror (v2) ──
+    // the roster arrives from the reader thread; passes complete on the
+    // tick loop (~2 s each) so the GUI sweeper is exercisable end to end
+    // with zero TWS credentials
+    private readonly ConcurrentDictionary<string, int> _passStartTick = new();
+
+    /// Roster push: clamp (billing-process mirror), abort de-listed passes
+    /// immediately, start one simulated pass per added ticker.
+    public void HandleSweepSet(SweepSet set)
+    {
+        var wanted = SweepPolicy.Clamp(set.Tickers.Select(e => e.Ticker));
+        foreach (var done in _passStartTick.Keys.Where(t => !wanted.Contains(t)).ToArray())
+        {
+            _passStartTick.TryRemove(done, out _);
+            _ = SendDone(done, ok: false, "aborted");
+        }
+        foreach (var t in wanted)
+            _passStartTick.TryAdd(t, 0); // 0 = awaiting the next tick to start
+    }
+
+    private async Task SendDone(string ticker, bool ok, string reason)
+    {
+        try
+        {
+            await _core.SendAsync("sweep_done", new SweepDone
+            {
+                Ticker = ticker, Ok = ok, Reason = reason, Requested = 0,
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"edge-sim: sweep_done send failed: {ex.Message}");
+        }
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -76,9 +113,28 @@ public sealed class SimulatedFeed
 
         using var timer = new PeriodicTimer(_interval);
         var tick = 0;
+        // one simulated pass ≈ 2 s of ticks
+        var passTicks = Math.Max(1, (int)(TimeSpan.FromSeconds(2) / _interval));
         while (await timer.WaitForNextTickAsync(ct))
         {
             tick++;
+
+            // sweep lifecycle: start pending passes, complete elapsed ones
+            foreach (var (t, start) in _passStartTick.ToArray())
+            {
+                if (start == 0)
+                {
+                    _passStartTick[t] = tick;
+                    continue;
+                }
+                if (tick - start >= passTicks)
+                {
+                    _passStartTick.TryRemove(t, out _);
+                    Console.Error.WriteLine($"edge-sim: {t}: one-pass sweep done (simulated)");
+                    await SendDone(t, ok: true, "");
+                }
+            }
+
             if (_bench is { } hb)
             {
                 var bp = spots[hb.ticker] * (1.0 + (_rng.NextDouble() - 0.5) * 0.0008);
@@ -128,7 +184,14 @@ public sealed class SimulatedFeed
 
             if (tick % 20 == 0)
             {
-                await _core.SendAsync("status", new StatusEvent { LinesUsed = _tickers.Count, MsgRate = 0, SnapshotSpend = 0, Connected = true }, ct);
+                await _core.SendAsync("status", new StatusEvent
+                {
+                    LinesUsed = _tickers.Count,
+                    MsgRate = 0,
+                    SnapshotSpend = 0,
+                    Connected = true,
+                    SweepActive = _passStartTick.Keys.OrderBy(t => t).ToArray(),
+                }, ct);
             }
         }
     }

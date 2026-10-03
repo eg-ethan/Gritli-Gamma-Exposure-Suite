@@ -229,3 +229,29 @@ func TestLiveBlendFlipVsBruteForce(t *testing.T) {
 		t.Fatalf("blended flip %v ≠ brute-force root %v (|err| %.3g)", snap.GammaFlipSpot, root, d)
 	}
 }
+
+// The 2026-10-01 crash pin at the exact crash site: a spot poisoned to
+// MaxFloat64 (IB's "unset" marker — finite and positive) makes every
+// |strike − spot| round straight back to MaxFloat64, so no strike ever wins
+// the ATM-nearest comparison and best stays nil. The guard must skip the
+// group like a no-quotes expiry — bad data never takes the process down.
+func TestBlendedVolsSurvivesMaxValueSpot(t *testing.T) {
+	cs := wingBookContracts()
+	in := BookInputs{
+		Chain: market.ChainSnapshot{Ticker: "TEST", Spot: math.MaxFloat64, AsOfMs: testAsOf.UnixMilli(), Contracts: cs},
+		Spot:  math.MaxFloat64, AsOf: testAsOf,
+		R:     testR, Q: testQ, Sigma: testFlat, LiveBlend: true,
+	}
+	vols := blendedVols(in, false) // must not panic
+	if len(vols) != len(cs) {
+		t.Fatalf("blendedVols returned %d vols, want %d (one per contract)", len(vols), len(cs))
+	}
+	// every expiry+class was skipped by the nil-best guard, so every contract
+	// degrades through the zero-reference blend — the output must stay a
+	// usable (finite, positive) vol, never garbage that would poison pricing
+	for i, v := range vols {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			t.Fatalf("vol[%d] = %v: poisoned spot must degrade to a safe anchor, not garbage", i, v)
+		}
+	}
+}

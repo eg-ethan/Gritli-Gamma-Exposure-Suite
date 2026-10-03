@@ -69,20 +69,18 @@ public sealed class TwsFeed : IDisposable
     public int ClientId { get; init; } = 11;
     public IReadOnlyList<string> Tickers { get; init; } = [];
 
-    // snapshot-sweep tuning: in-flight bounded by semaphore,
-    // the shared MsgPacer still caps the wire at 50 msg/s
+    // one-pass sweep tuning: in-flight bounded by semaphore, the shared
+    // MsgPacer still caps the wire at 50 msg/s. (v2: there is no cadence and
+    // no boot sweep — every snapshot the edge ever fires beyond a boot spot
+    // is behind a GUI one-pass click; the legacy --no-sweep/--sweep-seconds
+    // flags are accepted as no-ops for old scripts)
     public int SweepInFlight { get; init; } = 6;
-    public int SweepSeconds { get; init; } = 45;
     // rotating OI window: OI (tick 101) ships ONLY on streaming lines, and
     // streaming the whole index chain is impossible inside the 100-line
     // budget — so lease OiLines lines at a time, ATM-first, OiHoldSeconds
     // each; a full chain cycles in roughly chain/OiLines × (hold + pace)
     public int OiLines { get; init; } = 40;
     public int OiHoldSeconds { get; init; } = 15;
-    // rotation-only mode: NO snapshot requests at all (sweep engine
-    // off) — the OI rotation's streaming lines carry Greeks/IV in their
-    // default bundle and cycle the whole chain ATM-first
-    public bool NoSweep { get; init; }
 
     /// Hedge benchmark (Phase 3, spec §3): a SPOT-ONLY ticker — one permanent
     /// L1 line, no chain discovery, no sweeps, no OI rotation. Registered with
@@ -115,6 +113,16 @@ public sealed class TwsFeed : IDisposable
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     // latest underlying price per ticker (ATM ordering for the OI rotation)
     private readonly ConcurrentDictionary<string, double> _spot = new();
+
+    // ── on-demand one-pass sweeps (v2) ──
+    // a ticker's filtered chain from the core's sub_set — what a pass
+    // snapshots. Stored when discovery completes so a roster click arriving
+    // any time later can run a pass without re-resolving anything.
+    private readonly ConcurrentDictionary<string, IReadOnlyList<ContractMeta>> _sweptByTicker = new();
+    // ticker → its in-flight pass's cancellation source; the roster applier
+    // diffs against these (removed = abort mid-flight, slots/lines released
+    // by the existing watchdog path)
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _passCts = new();
 
     public TwsFeed(CoreConnection core) => _core = core;
 
@@ -162,13 +170,16 @@ public sealed class TwsFeed : IDisposable
         }
     }
 
-    /// Core pause (GUI Disconnect): cancel the run's loops and tear the TWS
-    /// socket down — every streaming line, OI lease and in-flight snapshot
-    /// dies with it, so NOTHING accrues against the account while paused.
-    /// Per-run state resets here so the next run starts from zero.
+    /// Core pause (v2: defensive dead code — no core path sends pause
+    /// anymore): cancel the run's loops and tear the TWS socket down, and
+    /// abort every in-flight pass with sweep_done{paused} so the core's
+    /// roster converges. Paid work never resumes by itself.
     internal void OnCorePause()
     {
         if (Interlocked.Exchange(ref _paused, 1) == 1) return;
+        foreach (var ticker in _passCts.Keys.ToArray())
+            CancelPass(ticker, "paused");
+        _sweptByTicker.Clear();
         try { _runCts?.Cancel(); } catch (Exception) { /* already torn down */ }
         try { _client?.eDisconnect(); } catch (Exception) { /* socket already gone */ }
         _activeRequests.Clear();
@@ -273,6 +284,7 @@ public sealed class TwsFeed : IDisposable
         // one pool per budget class, shared by every ticker's loops below
         _sweepGate = new SemaphoreSlim(Math.Max(1, SweepInFlight));
         _oiGate = new SemaphoreSlim(Math.Max(1, OiLines));
+        _sweptByTicker.Clear(); // per-run: a fresh run re-discovers fresh chains
 
         if (_paused == 1)
             return; // paused mid-startup (frozen-connect race): idle until resume
@@ -332,6 +344,8 @@ public sealed class TwsFeed : IDisposable
                 MsgRate = _pacer.MsgRate,
                 SnapshotSpend = spend,
                 Connected = _client?.IsConnected() ?? false,
+                // metered truth: which passes are actually running right now
+                SweepActive = _passCts.Keys.OrderBy(t => t).ToArray(),
             });
         }
     }
@@ -531,13 +545,13 @@ public sealed class TwsFeed : IDisposable
         return true;
     }
 
-    /// Apply the core's selection. EVERY ticker sweeps + rotates —
-    /// index or equity: streaming N full chains cannot fit the 100-line
-    /// budget, snapshots cost no continuous lines, and the shared gates
-    /// keep the whole watchlist inside it exactly like a single SPX does.
+    /// Apply the core's selection. NO boot-time chain sweeps (v2): the only
+    /// snapshots the edge ever fires beyond a boot spot are behind a GUI
+    /// one-pass click. The filtered chain is stored for the roster applier;
+    /// the OI rotation keeps the book warm ATM-first on streaming lines.
     /// Returns false when NOTHING resolved (caller retries discovery);
-    /// a partial resolution is still true — the loops proceed with what
-    /// resolved and the retry-free cadence refreshes the rest.
+    /// a partial resolution is still true — the rotation proceeds with what
+    /// resolved and its cadence refreshes the rest.
     private async Task<bool> SubscribeSetAsync(string ticker, SubSet sub, CancellationToken ct)
     {
         var keep = sub.Keep.Select(k => (k.TradingClass, k.Date)).ToHashSet();
@@ -547,91 +561,220 @@ public sealed class TwsFeed : IDisposable
             return false;
 
         // per-(class, expiry) windows: the 2SD width scales with DTE, so
-        // bounding the sweep by the global envelope alone would request
+        // bounding a pass by the global envelope alone would request
         // near-dated far-OTM rows the core's filter dropped. Equity sub_sets
         // may carry no windows — the envelope is then the whole filter.
         var swept = Budget.WithinWindows(wanted, sub.Windows, sub.StrikeLo, sub.StrikeHi);
+        _sweptByTicker[ticker] = swept;
 
-        if (NoSweep)
-        {
-            // --no-sweep: zero snapshot spend. The book still fills — model
-            // Greeks/IV ride the DEFAULT bundle of the OI rotation's
-            // streaming lines, cycling the chain ATM-first — and the
-            // underlying L1 lines keep spot live. Fresher than snapshots for
-            // ATM, slower for the wings.
-            var (u, c, _) = _lines.Read();
-            Console.Error.WriteLine($"edge: {ticker}: rotation-only mode (--no-sweep, no snapshots) — " +
-                                    $"{swept.Count} contracts cycle through {Math.Min(Math.Max(OiLines, 1), c)} streaming lines, {u} used");
-        }
-        else
-        {
-            var (used, cap, _) = _lines.Read();
-            Console.Error.WriteLine($"edge: {ticker}: snapshot-sweep mode ({(IndexPrimitives.IsIndex(ticker) ? "index" : "equity")}) — " +
-                                    $"{swept.Count} of {wanted.Count} resolved " +
-                                    $"(streaming would need {wanted.Count} of {cap} lines, {used} used)");
-            _ = SweepLoopAsync(ticker, swept, ct);
-        }
-        if (OiLines > 0) // 0 disables: sweeps may carry OI themselves (106,101)
+        var (u, c, _) = _lines.Read();
+        Console.Error.WriteLine($"edge: {ticker}: rotation-only boot (no auto-sweep; GUI one-pass on demand) — " +
+                                $"{swept.Count} contracts cycle through {Math.Min(Math.Max(OiLines, 1), c)} streaming lines, {u} used");
+
+        if (OiLines > 0) // 0 disables: passes may carry OI themselves (106,101)
             _ = OIRotationLoopAsync(ticker, swept, ct);
         return true;
     }
 
-    /// Snapshot sweep: snapshots consume no CONTINUOUS
-    /// lines and arrive through the IDENTICAL optcomp normalization path, so
-    /// the index book refreshes on a paced cadence instead of holding
-    /// hundreds of streaming lines. One loop per ticker.
+    // ── on-demand one-pass sweeps (v2) ─────────────────────────────────────
+    //
+    // The core pushes the FULL in-flight roster (set semantics, empty =
+    // abort everything). The edge is the billing process: it re-clamps the
+    // cap and re-checks windows no matter what the core says, then runs
+    // exactly ONE full-chain pass per added ticker and reports sweep_done.
+    // Nothing repeats, nothing re-arms, nothing sweeps at boot.
+
+    /// Roster push: abort passes the roster no longer lists, start one pass
+    /// per added ticker. Called from the reader thread — everything here is
+    /// fire-and-forget.
+    internal void OnCoreSweepSet(SweepSet set)
+    {
+        var wanted = SweepPolicy.Clamp(set.Tickers.Select(e => e.Ticker));
+        foreach (var ticker in _passCts.Keys.ToArray())
+        {
+            if (!wanted.Contains(ticker))
+                CancelPass(ticker, "aborted");
+        }
+        foreach (var ticker in wanted)
+        {
+            if (_passCts.TryAdd(ticker, new CancellationTokenSource()))
+            {
+                Console.Error.WriteLine($"edge: {ticker}: one-pass sweep requested (GUI click)");
+                _ = PassOnceAsync(ticker);
+            }
+            // already in flight — the push is set semantics, not a queue
+        }
+    }
+
+    /// Abort one in-flight pass: cancel its token (in-flight snapshot slots
+    /// and lines release through the existing FinishSnapshot/watchdog path)
+    /// and tell the core why. Snapshots already sent to TWS stay on the
+    /// meter — that is IBKR's accounting — but not one more fires.
+    private void CancelPass(string ticker, string reason)
+    {
+        if (_passCts.TryRemove(ticker, out var cts))
+        {
+            try { cts.Cancel(); } catch (Exception) { /* already cancelled */ }
+            Console.Error.WriteLine($"edge: {ticker}: pass aborted ({reason})");
+            SendSweepDone(ticker, ok: false, reason, 0);
+        }
+    }
+
+    /// ONE ticker's pass, start to sweep_done: window re-check (the edge
+    /// re-verifies what the core already validated — clock skew, a window
+    /// that closed between click and push), coverage check, bounded wait for
+    /// discovery, then a single RunPassAsync over the filtered chain.
+    private async Task PassOnceAsync(string ticker)
+    {
+        var cts = _passCts[ticker];
+        try
+        {
+            if (!Tickers.Contains(ticker))
+            {
+                SendSweepDone(ticker, ok: false, "ticker not covered by this edge (--tickers)", 0);
+                return;
+            }
+            if (SweepPolicy.BlockedReason(ticker, DateTimeOffset.Now) is { Length: > 0 } blocked)
+            {
+                SendSweepDone(ticker, ok: false, blocked, 0);
+                return;
+            }
+
+            // discovery may still be running for a ticker clicked at boot —
+            // wait (bounded) for its filtered chain
+            IReadOnlyList<ContractMeta>? metas = null;
+            var deadline = DateTime.UtcNow.AddSeconds(60);
+            while (metas is null && DateTime.UtcNow < deadline && !cts.IsCancellationRequested)
+            {
+                if (!_sweptByTicker.TryGetValue(ticker, out metas))
+                {
+                    try { await Task.Delay(500, cts.Token); }
+                    catch (OperationCanceledException) { break; }
+                }
+            }
+            if (cts.IsCancellationRequested)
+                return; // CancelPass already sent the aborted sweep_done
+            if (metas is null || metas.Count == 0)
+            {
+                SendSweepDone(ticker, ok: false, "discovery incomplete", 0);
+                return;
+            }
+
+            // TWS may still be handshaking after a reconnect (farms gate
+            // everything) — a pass fired into a dead socket requests nothing
+            // and used to report a fake "done (0 contracts)". Wait, bounded.
+            var connDeadline = DateTime.UtcNow.AddSeconds(60);
+            while (!(_client is { } cl && cl.IsConnected()) && DateTime.UtcNow < connDeadline && !cts.IsCancellationRequested)
+            {
+                try { await Task.Delay(500, cts.Token); }
+                catch (OperationCanceledException) { break; }
+            }
+            if (!(_client is { } live2 && live2.IsConnected()))
+            {
+                SendSweepDone(ticker, ok: false, "tws not connected", 0);
+                return;
+            }
+
+            try
+            {
+                var requested = await RunPassAsync(ticker, metas, cts.Token);
+                if (requested == 0)
+                {
+                    SendSweepDone(ticker, ok: false, "no snapshots fired (line budget spent?)", 0);
+                    return;
+                }
+                SendSweepDone(ticker, ok: true, "", requested);
+            }
+            catch (OperationCanceledException)
+            {
+                SendSweepDone(ticker, ok: false, "aborted", 0);
+            }
+            catch (Exception ex)
+            {
+                SendSweepDone(ticker, ok: false, ex.Message, 0);
+            }
+        }
+        finally
+        {
+            // remove only OUR registration — a re-request racing the abort
+            // may already have installed a fresh one
+            _passCts.TryRemove(new KeyValuePair<string, CancellationTokenSource>(ticker, cts));
+            cts.Dispose();
+        }
+    }
+
+    /// Report one pass outcome to the core (never throws, never blocks the
+    /// caller — the reader thread may be underneath us).
+    private void SendSweepDone(string ticker, bool ok, string reason, int requested)
+    {
+        if (!ok)
+            Console.Error.WriteLine($"edge: {ticker}: pass refused/aborted: {reason}");
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _core.SendAsync("sweep_done", new SweepDone
+                {
+                    Ticker = ticker, Ok = ok, Reason = reason, Requested = requested,
+                }, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"edge: sweep_done send failed: {ex.Message}");
+            }
+        });
+    }
+
+    /// ONE full-chain pass: every contract of the filtered chain gets a
+    /// paced regulatory snapshot; snapshots consume no CONTINUOUS lines and
+    /// arrive through the IDENTICAL optcomp normalization path, so the book
+    /// refreshes in minutes instead of a rotation cycle.
     ///
     /// In-flight discipline: the gate slot travels with the snapshot until it
     /// ENDS (tickSnapshotEnd / watchdog) — acquiring lines faster than
     /// snapshots complete is how the account line cap gets crossed.
-    private async Task SweepLoopAsync(string ticker, IReadOnlyList<ContractMeta> metas, CancellationToken ct)
+    private async Task<int> RunPassAsync(string ticker, IReadOnlyList<ContractMeta> metas, CancellationToken ct)
     {
         var gate = _sweepGate!; // shared across tickers: ≤ SweepInFlight snapshots in flight account-wide
-
-        while (_client is { } client && client.IsConnected())
+        var sw = Stopwatch.StartNew();
+        var requested = 0;
+        try
         {
-            var sw = Stopwatch.StartNew();
-            var requested = 0;
-            try
+            await Task.WhenAll(metas.Select(async meta =>
             {
-                await Task.WhenAll(metas.Select(async meta =>
+                await gate.WaitAsync(ct);
+                var slotOwned = true;
+                try
                 {
-                    await gate.WaitAsync(ct);
-                    var slotOwned = true;
-                    try
-                    {
-                        if (_client is not { } c || !c.IsConnected()) return;
-                        if (!_lines.TryAcquire()) return; // budget spent — skip, next pass retries
-                        var reqId = NextReqId();
-                        _activeRequests[reqId] = meta;
-                        _lineHeld[reqId] = 0;
-                        _snapshotDone[reqId] = () => gate.Release(); // slot travels with the snapshot
-                        slotOwned = false;
-                        await _pacer.WaitAsync(ct);
-                        _lines.ChargeSnapshot(); // ~$0.01 accounting, rides the status heartbeat
-                        // 106,13: snapshots reject ALL generic ticks (TWS 321:
-                        // "Snapshot market data subscription is not
-                        // applicable to generic ticks") — IV/Greeks ride the
-                        // default option bundle; OI needs the rotation loop
-                        c.reqMktData(reqId, OptionContract(ticker, meta), "106,13", true, false, new List<TagValue>());
-                        Interlocked.Increment(ref requested);
-                        _ = WatchSnapshotAsync(reqId); // snapshotEnd may never come
-                    }
-                    finally { if (slotOwned) gate.Release(); }
-                }).ToArray());
-            }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"edge: {ticker}: sweep pass failed: {ex.Message}");
-            }
-
-            var (used, cap, spend) = _lines.Read();
-            Console.Error.WriteLine($"edge: {ticker}: snapshot sweep {requested}/{metas.Count} in {sw.ElapsedMilliseconds} ms " +
-                                    $"(lines {used}/{cap}, ${spend:F2})");
-            try { await Task.Delay(TimeSpan.FromSeconds(SweepSeconds), ct); }
-            catch (OperationCanceledException) { break; }
+                    if (_client is not { } c || !c.IsConnected()) return;
+                    if (!_lines.TryAcquire()) return; // budget spent — skip, report covers it
+                    var reqId = NextReqId();
+                    _activeRequests[reqId] = meta;
+                    _lineHeld[reqId] = 0;
+                    _snapshotDone[reqId] = () => gate.Release(); // slot travels with the snapshot
+                    slotOwned = false;
+                    await _pacer.WaitAsync(ct);
+                    _lines.ChargeSnapshot(); // ~$0.01 accounting, rides the status heartbeat
+                    // 106,13: snapshots reject ALL generic ticks (TWS 321:
+                    // "Snapshot market data subscription is not
+                    // applicable to generic ticks") — IV/Greeks ride the
+                    // default option bundle; OI needs the rotation loop
+                    c.reqMktData(reqId, OptionContract(ticker, meta), "106,13", true, false, new List<TagValue>());
+                    Interlocked.Increment(ref requested);
+                    _ = WatchSnapshotAsync(reqId); // snapshotEnd may never come
+                }
+                finally { if (slotOwned) gate.Release(); }
+            }).ToArray());
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Console.Error.WriteLine($"edge: {ticker}: sweep pass failed: {ex.Message}");
+        }
+
+        var (used, cap, spend) = _lines.Read();
+        Console.Error.WriteLine($"edge: {ticker}: one-pass sweep {requested}/{metas.Count} in {sw.ElapsedMilliseconds} ms " +
+                                $"(lines {used}/{cap}, ${spend:F2})");
+        return requested;
     }
 
     /// Watchdog: a refused snapshot never sends tickSnapshotEnd — force its
@@ -766,6 +909,10 @@ public sealed class TwsFeed : IDisposable
             Vega = vega,
             Theta = theta,
             OpenInterest = _lastOI.TryGetValue(reqId, out var oi) ? oi : 0,
+            // _lineHeld marks snapshot-held reqIds: a pass snapshot ("snap")
+            // vs the rotation's streaming line ("stream") — the master log's
+            // Source column is truthful from here on
+            Src = _lineHeld.ContainsKey(reqId) ? "snap" : "stream",
         });
     }
 

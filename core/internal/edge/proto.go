@@ -27,8 +27,11 @@ import (
 	"io"
 )
 
-// ProtoVersion is the wire protocol version this build speaks.
-const ProtoVersion = 1
+// ProtoVersion is the wire protocol version this build speaks. v2 renamed the
+// sweep roster to one-pass semantics (SweepEntry lost intervalSeconds) and
+// added sweep_done; the gate below rejects a mixed core/edge pair loudly
+// rather than letting a stale edge silently ignore the roster it is handed.
+const ProtoVersion = 2
 
 // MaxLineBytes caps one wire frame; chains are wide but never MiB-wide.
 const MaxLineBytes = 1 << 20
@@ -64,6 +67,14 @@ const (
 	// registers it so its spot events apply without the unknown-ticker
 	// anomaly and with no chain ever expected. Additive in v1.
 	TypeSpotSub = "spot_sub"
+
+	// TypeSweepDone reports the outcome of ONE roster pass (v2): ok = the
+	// pass covered the filtered chain; !ok + reason = aborted (kill/Disconnect
+	// cleared the roster, or the edge refused: window closed at the edge,
+	// ticker not covered, discovery incomplete). The core drops the roster
+	// entry either way — a completed pass never re-arms, and the GUI row
+	// returns to idle.
+	TypeSweepDone = "sweep_done"
 )
 
 // Core → edge messages (ControlPlane + handshake replies).
@@ -72,20 +83,24 @@ const (
 	TypeSubSet  = "sub_set" // reply to chain: the selection result to subscribe
 	TypeError   = "error"   // protocol/ingest error the edge must see
 
-	// Pause/Resume are the GUI-disconnect backpressure carried to the edge:
-	// the core already freezes applies while feeds are off; pause ALSO tells
-	// the edge to stop requesting market data (cancel snapshots/OI
-	// rotations, suspend sweeps) so nothing accrues against the account
-	// while nobody is watching the GUI. Resume re-enables; the edge
-	// re-subscribes from its own state machine. Additive to v1.
-	TypePause  = "pause"  // feeds off: cancel subscriptions, suspend loops
-	TypeResume = "resume" // feeds on: resume requesting market data
+	// Pause/Resume are RETAINED as defensive dead code in v2: the GUI-freeze
+	// machinery that pushed them (edge feeds paused while nobody watched, so
+	// the snapshot meter could not run behind a frozen GUI) was removed when
+	// sweeps became on-demand — collection now runs continuously and only a
+	// deliberate GUI action (kill pill, Disconnect, Stop) spends or stops
+	// anything. No core code path sends these; the edge still honors one if
+	// it ever arrives (aborting any in-flight pass cleanly).
+	TypePause  = "pause"  // (unsent) stop all TWS-side requesting
+	TypeResume = "resume" // (unsent) resume requesting market data
 
 	// Sweep control (GUI → core → edge): the core owns the validated roster
 	// (sweep_policy.go) and pushes the full set — including EMPTY — whenever
 	// it changes and after every hello. Empty-on-hello is what makes a core
 	// restart stop a stale edge: nothing arms without the GUI's say-so.
-	TypeSweepSet = "sweep_set" // {tickers:[{ticker,intervalSeconds}]} — the whole roster
+	// v2 semantics: every entry is ONE full-chain pass the edge runs once and
+	// reports via sweep_done — there are no repeating intervals, and boot,
+	// discovery, resume, and core restart all leave the roster empty.
+	TypeSweepSet = "sweep_set" // {tickers:[{ticker}]} — the whole in-flight roster
 
 	// TypeSpotAck replies to spot_sub: the registration landed. Correlated
 	// by Id like chain → sub_set. Additive in v1.
@@ -232,31 +247,38 @@ type DepthEvent struct {
 
 // StatusEvent is the EdgeStatus heartbeat: the C# edge's line accounting and
 // pacing health (architecture.md §5 EdgeStatus row), plus the sweep-control
-// truth — which tickers actually have a sweep loop running and whether the
-// armed roster sits inside the shutoff windows (sweep_policy.go).
+// truth — which tickers actually have a pass in flight right now. The GUI's
+// "sweeping" rows render THIS, not the roster: metered truth over intent.
 type StatusEvent struct {
 	LinesUsed     int     `json:"linesUsed"`
 	MsgRate       float64 `json:"msgRate"`
 	SnapshotSpend float64 `json:"snapshotSpend"`
 	Connected     bool    `json:"connected"`
-	// SweepActive lists tickers with a live sweep loop right now (additive;
-	// absent on old edges). The GUI's "sweeping" dots and the sweeper panel
-	// render THIS, not the roster — metered truth over intent.
+	// SweepActive lists tickers with a live one-pass sweep right now (v2).
 	SweepActive []string `json:"sweepActive,omitempty"`
-	// SweepWindowOpen reports whether every armed ticker's window is open
-	// (true when nothing is armed). Additive.
-	SweepWindowOpen bool `json:"sweepWindowOpen,omitempty"`
 }
 
-// SweepEntry is one armed ticker in a sweep roster.
+// SweepEntry is one ticker whose single pass the edge should run (v2: no
+// interval — the entry IS the request; the edge fires one full-chain pass
+// and answers with sweep_done).
 type SweepEntry struct {
-	Ticker          string `json:"ticker"`
-	IntervalSeconds int    `json:"intervalSeconds"`
+	Ticker string `json:"ticker"`
 }
 
-// SweepSet is the sweep_set payload: the FULL roster, not a delta.
+// SweepSet is the sweep_set payload: the FULL in-flight roster, not a delta.
 type SweepSet struct {
 	Tickers []SweepEntry `json:"tickers"`
+}
+
+// SweepDone is the sweep_done payload: the outcome of one roster pass.
+type SweepDone struct {
+	Ticker string `json:"ticker"`
+	// Ok: the pass ran to completion over the filtered chain. !Ok + Reason:
+	// aborted (kill/Disconnect) or refused (window closed at the edge, ticker
+	// not covered by this edge, discovery incomplete).
+	Ok        bool   `json:"ok"`
+	Reason    string `json:"reason,omitempty"`
+	Requested int    `json:"requested"` // contracts the pass requested
 }
 
 // ErrorMsg is the core→edge error payload.

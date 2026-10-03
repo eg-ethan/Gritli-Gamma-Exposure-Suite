@@ -27,10 +27,8 @@ public static class Program
         var seed = 42;
         var intervalMs = 250;
         var sweepInFlight = 6;
-        var sweepSeconds = 45;
         var oiLines = 40;
         var oiHoldSeconds = 30;
-        var noSweep = false;
         var hedgeBench = "";
         var instance = Environment.MachineName + "-gex-edge";
 
@@ -46,10 +44,15 @@ public static class Program
                 case "--seed": seed = int.Parse(args[++i]); break;
                 case "--interval-ms": intervalMs = int.Parse(args[++i]); break;
                 case "--sweep-inflight": sweepInFlight = int.Parse(args[++i]); break;
-                case "--sweep-seconds": sweepSeconds = int.Parse(args[++i]); break;
+                case "--sweep-seconds":
+                    _ = int.Parse(args[++i]); // deprecated (v2): one-pass sweeps have no cadence
+                    Console.Error.WriteLine("gex-edge: --sweep-seconds is a no-op — sweeps are GUI one-pass clicks now");
+                    break;
                 case "--oi-lines": oiLines = int.Parse(args[++i]); break;
                 case "--oi-hold-seconds": oiHoldSeconds = int.Parse(args[++i]); break;
-                case "--no-sweep": noSweep = true; break; // zero snapshot spend: rotation-only
+                case "--no-sweep": // deprecated (v2): boot never sweeps; accepted so old scripts run
+                    Console.Error.WriteLine("gex-edge: --no-sweep is a no-op — no sweep ever starts at boot; GUI one-pass on demand");
+                    break;
                 case "--hedge-bench": hedgeBench = args[++i].Trim().ToUpperInvariant(); break; // spot-only benchmark: one L1 line, no chain
                 case "--instance": instance = args[++i]; break;
                 default:
@@ -77,7 +80,9 @@ public static class Program
                     var tickers = Tickers.Select(t => (t, IndexPrimitives.SeedSpot(t), 0.20)).ToList();
                     (string ticker, double spot)? bench =
                         string.IsNullOrEmpty(hedgeBench) ? null : (hedgeBench, IndexPrimitives.SeedSpot(hedgeBench));
-                    await new SimulatedFeed(conn, tickers, TimeSpan.FromMilliseconds(intervalMs), seed, bench).RunAsync(cts.Token);
+                    var sim = new SimulatedFeed(conn, tickers, TimeSpan.FromMilliseconds(intervalMs), seed, bench);
+                    conn.OnSweepSet = sim.HandleSweepSet;
+                    await sim.RunAsync(cts.Token);
                 }
                 else
                 {
@@ -88,16 +93,14 @@ public static class Program
                         ClientId = clientId,
                         Tickers = Tickers,
                         SweepInFlight = sweepInFlight,
-                        SweepSeconds = sweepSeconds,
                         OiLines = oiLines,
                         OiHoldSeconds = oiHoldSeconds,
-                        NoSweep = noSweep,
                         HedgeBench = string.IsNullOrEmpty(hedgeBench) ? null : hedgeBench,
                     };
-                    // GUI Disconnect/Connect now reaches the edge: pause
-                    // tears the TWS session down (no snapshot spend while
-                    // the GUI is frozen), resume rebuilds from fresh
-                    // discovery
+                    // v2: the one-pass sweep roster is the only sweep control
+                    // (nothing sweeps at boot, ever); pause/resume are
+                    // defensive dead code the core no longer sends
+                    conn.OnSweepSet = feed.OnCoreSweepSet;
                     conn.OnPause = feed.OnCorePause;
                     conn.OnResume = feed.OnCoreResume;
                     await feed.RunAsync(cts.Token);

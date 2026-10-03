@@ -232,6 +232,57 @@ func TestStreamsAPI(t *testing.T) {
 	}
 }
 
+// TestSweepsEndpoints pins the one-pass sweep surface: POST installs the
+// full ticker set (plain strings), kill aborts everything, and — the v2
+// Disconnect contract — connect=false kills the sweeps while connect=true
+// never arms anything.
+func TestSweepsEndpoints(t *testing.T) {
+	svc := testService(t)
+	srv, err := NewServer(svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var applied []string
+	kills := 0
+	srv.SetSweeps(SweepsAPI{
+		View:  func() any { return map[string]any{"enabled": true, "max": 2, "rows": []any{}} },
+		Apply: func(tickers []string) error { applied = tickers; return nil },
+		Kill:  func() error { kills++; return nil },
+	})
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("POST", "/api/sweeps", strings.NewReader(`{"tickers":["TSLA","NVDA"]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("apply: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(applied) != 2 || applied[0] != "TSLA" || applied[1] != "NVDA" {
+		t.Fatalf("applied = %v, want [TSLA NVDA]", applied)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("POST", "/api/sweeps", strings.NewReader(`{"kill":true}`)))
+	if rec.Code != 200 || kills != 1 {
+		t.Fatalf("kill: %d kills=%d", rec.Code, kills)
+	}
+
+	// Disconnect stops the sweeps (the only pause-adjacent action left);
+	// reconnecting must NOT arm anything.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("POST", "/api/streams", strings.NewReader(`{"stream":"all","connect":false}`)))
+	if rec.Code != 200 {
+		t.Fatalf("disconnect: %d %s", rec.Code, rec.Body.String())
+	}
+	if kills != 2 {
+		t.Fatalf("disconnect must kill sweeps (kills=%d)", kills)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq("POST", "/api/streams", strings.NewReader(`{"stream":"all","connect":true}`)))
+	if rec.Code != 200 || kills != 2 {
+		t.Fatalf("reconnect must not touch sweeps (kills=%d)", kills)
+	}
+}
+
 func TestEventsStreamInitial(t *testing.T) {
 	svc := testService(t)
 	srv, err := NewServer(svc)

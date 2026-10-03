@@ -2,6 +2,7 @@ package market
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -110,5 +111,35 @@ func TestRegimeFor(t *testing.T) {
 	}
 	if RegimeFor(-1) != RegimeNegative || RegimeFor(0) != RegimeNegative {
 		t.Fatal("zero/negative GEX should be NEGATIVE_GAMMA (reference: totalGex > 0)")
+	}
+}
+
+// The 2026-10-01 crash pin: IB delivers "unset" as C# double.MaxValue —
+// finite and positive, so it slips past naive >0/NaN/Inf checks and, at that
+// magnitude, poisoned the ATM-strike math downstream (the blendedVols
+// nil-deref that restarted the live core). The book rejects it on both write
+// paths and the stored spot never moves.
+func TestBookRejectsMaxValueSpot(t *testing.T) {
+	book := NewInMemoryBook()
+	snap := ChainSnapshot{
+		Ticker: "SPX", Spot: math.MaxFloat64, AsOfMs: 1,
+		Contracts: []Contract{
+			{ConId: 1, Ticker: "SPX", Strike: 7600, Right: RightCall, ExpiryDate: "20261016", OpenInterest: 10},
+		},
+	}
+	if err := book.ApplyChainSnapshot(context.Background(), snap); err == nil {
+		t.Fatal("MaxFloat64 chain spot must be rejected")
+	}
+	snap.Spot = 7600
+	if err := book.ApplyChainSnapshot(context.Background(), snap); err != nil {
+		t.Fatalf("sane chain spot rejected: %v", err)
+	}
+	for _, v := range []float64{math.MaxFloat64, 0, math.NaN(), math.Inf(1)} {
+		if err := book.ApplySpot(context.Background(), "SPX", v, 2); err == nil {
+			t.Fatalf("poisoned spot tick %v must be rejected", v)
+		}
+	}
+	if got, _ := book.Latest("SPX"); got.Spot != 7600 {
+		t.Fatalf("rejected ticks must not move the book: spot = %v", got.Spot)
 	}
 }

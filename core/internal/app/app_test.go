@@ -381,60 +381,10 @@ func TestMultiTickerPersistenceKeepsChainsSeparate(t *testing.T) {
 	}
 }
 
-// TestExternalFeedGate: with an external feed owning the streams, every
-// stream-switch transition drives the gate — Disconnect (both streams off)
-// freezes the feed, any connected state resumes it, and single-stream toggles
-// keep it running while one stream remains connected.
-func TestExternalFeedGate(t *testing.T) {
-	svc, err := New(testConfig(""))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go svc.Run(ctx)
-	svc.UseExternalFeed()
-
-	var last bool
-	calls := 0
-	svc.SetExternalFeedGate(func(on bool) {
-		last = on
-		calls++
-	})
-
-	must := func(on bool) {
-		t.Helper()
-		if err := svc.SetStream(StreamAll, on); err != nil {
-			t.Fatalf("SetStream(%v): %v", on, err)
-		}
-	}
-
-	must(true)
-	if !last {
-		t.Fatal("connect must resume the external feed (gate=true)")
-	}
-	n := calls
-
-	// single-stream toggle: one stream still connected — the feed stays on
-	if err := svc.SetStream(StreamUnderlying, false); err != nil {
-		t.Fatal(err)
-	}
-	if !last || calls != n {
-		t.Fatalf("single-stream toggle must not touch the feed gate (last=%v calls=%d)", last, calls)
-	}
-
-	// last stream off — freeze
-	must(false)
-	if last || calls != n+1 {
-		t.Fatalf("full disconnect must freeze the feed (last=%v calls=%d)", last, calls)
-	}
-
-	// reconnect — resume
-	must(true)
-	if !last || calls != n+2 {
-		t.Fatalf("reconnect must resume the feed (last=%v calls=%d)", last, calls)
-	}
-}
+// (v2) TestExternalFeedGate is gone with the gate it pinned: GUI
+// connect/disconnect no longer freezes the external feed — collection runs
+// continuously, and the Disconnect sweep kill is pinned at the httpui layer
+// (TestSweepsEndpoints).
 
 // TestBootStaleChainIdlesSilently: a saved chain with nothing beyond same-day
 // expiry (the 2026-09-18 live shape — monthly-expiry Friday after a restart)

@@ -20,7 +20,7 @@ summed by strike and by expiry. The call wall is the strike with the largest cal
 
 Everything above depends on a live options chain, and the TWS API puts hard limits on how that chain can be pulled. A standard account gets 100 concurrent streaming market-data lines and 50 outbound messages per second. An SPX chain filtered to two standard deviations around spot still selects about 1,110 contracts, so streaming every contract is impossible and the collection layer has to budget every line.
 
-IBKR's official API client is C#, and it has no official Go version, so the project splits along that line. A small C# edge service (`edge/`) is the only part that talks to TWS. It paces requests with a 50 msg/s token bucket and counts every market-data line it opens. Once a chain is discovered, it rotates streaming lines through the contracts ATM-first to collect Greeks and implied vol. The edge can also refresh chains with paced snapshot sweeps, but every snapshot is a billed request, and sweeps run unless the edge is started with `--no-sweep` (see the cost warning under Running it). The edge never does math or touches the database. Its callbacks stamp a receive time, since the TWS API sends no timestamps, and hand the event off immediately.
+IBKR's official API client is C#, and it has no official Go version, so the project splits along that line. A small C# edge service (`edge/`) is the only part that talks to TWS. It paces requests with a 50 msg/s token bucket and counts every market-data line it opens. Once a chain is discovered, it rotates streaming lines through the contracts ATM-first to collect Greeks and implied vol. The edge can also refresh a chain on demand with a paced one-pass snapshot sweep, but every snapshot is a billed request — passes run ONLY behind the GUI's "Run 1 pass" button, never at boot (see the cost warning under Running it). The edge never does math or touches the database. Its callbacks stamp a receive time, since the TWS API sends no timestamps, and hand the event off immediately.
 
 Open interest turned out to be the hardest input. Some TWS market-data bundles never deliver option OI ticks, and with the `q = ±OI` baseline, missing OI means every exposure reads zero. The Go core fills that gap from CBOE's public delayed-quotes feed (`--oi-vendor cboe`, on by default). OI only updates once a day, so a delayed vendor quote is as fresh as that number gets during the session.
 
@@ -42,7 +42,25 @@ Results go to SQLite, which the core alone owns. On restart it reloads the last 
 
 ## Hedging your own book
 
-Separate from the market-wide dealer exposure above, the **Beta Hedge** panel sizes a hedge for the positions you enter yourself: signed shares and option legs on one asset, beta-weighted onto one benchmark ETF. β is raw OLS over a 252-session trailing window of adjusted daily closes, loaded with `gexctl load-closes` (a ±35% plausibility tripwire rejects split-contaminated files by date, and a re-adjusted vendor history must be re-loaded whole with `--replace`). Option legs price at the same volblend surface the engine uses, with IBKR's model delta shown alongside as a reference. The benchmark's spot is the edge's real L1 line — the C# edge's `--hedge-bench` flag holds one permanent spot-only subscription for it, and `gexctl serve --edge-sim` announces it the same way. The output is a target benchmark share count — never an order — and every failure mode (insufficient history with the session count shown, a stale spot during regular hours with the last target kept and grayed, an unresolved leg) is an explicit state rather than a zero. The panel and its flags are documented in `core/README-GUI.md`; the decision record is `architecture.md` §12.
+Separate from the market-wide dealer exposure above, the **Beta Hedge** panel sizes a hedge for the positions you enter yourself: signed shares and option legs on one asset, beta-weighted onto one benchmark ETF. Option legs price at the same volblend surface the engine uses, with IBKR's model delta shown alongside as a reference. The output is a target benchmark share count — never an order.
+
+Setting it up (the running example is long PANW hedged with CIBR; details in `core/README-GUI.md`, decision record in `architecture.md` §12):
+
+1. **Pick the pair.** The asset must be a watchlist ticker — solver Greeks need its chain, so it also has to be in the edge's `--tickers`. The benchmark is spot-only: any liquid ETF, one permanent L1 line, no chain. Enter the pair once in the panel's form; it persists.
+2. **Load adjusted daily closes for both.** β is raw OLS over a 252-session trailing window and needs ≥ 200 overlapping sessions:
+
+   ```bash
+   cd core
+   ./gexctl load-closes --ticker PANW --closes panw_closes.csv --db gex.db
+   ./gexctl load-closes --ticker CIBR --closes cibr_closes.csv --db gex.db
+   ```
+
+   The files are strict two-column `date,close` with split- and dividend-adjusted closes — Yahoo's "Adj Close" or Stooq's daily history both work. A ±35% plausibility tripwire rejects split-contaminated files by date, and a re-adjusted vendor history must be re-loaded whole with `--replace`. Load before starting `serve` (SQLite is single-owner).
+
+3. **Run the benchmark on the edge.** Start the C# edge with `--hedge-bench CIBR` — the benchmark rides one permanent spot-only L1 subscription (`gexctl serve --edge-sim` announces a stored pair's benchmark the same way, no TWS needed). A running edge does not learn a NEW benchmark from a GUI pair change; restart it with the new flag.
+4. **Enter your positions** in the panel: signed shares, or option contracts by expiry/strike/right. Use an expiry that actually exists in the asset's chain — equity monthlies expire on Fridays — a leg that matches no contract stays flagged `unresolved` rather than guessing.
+
+Every failure mode is an explicit state rather than a zero: `insufficient history` with the session count shown, a stale spot during regular hours with the last target kept and grayed, an unresolved leg. β, ρ and both annualized vols are always shown when computable — a low ρ means basis risk no target size can fix.
 
 ## Checking the math
 
@@ -52,7 +70,16 @@ The equations behind the solver and exposure engine are in `docs/equations.md`, 
 
 ## Running it
 
-The core is a single Go binary with one dependency (`modernc.org/sqlite`, pure Go, no CGO), and the GUI is embedded in it. With no TWS connection, the built-in simulator drives the full edge protocol, which is the quickest way to see the dashboard.
+The core is a single Go binary with one dependency (`modernc.org/sqlite`, pure Go, no CGO), and the GUI is embedded in it. What you need depends on how far you take it:
+
+| Path | Prerequisites |
+| --- | --- |
+| Simulator (no TWS, no account, no cost) | Go 1.27 or newer |
+| Paper or live data | Go 1.27 or newer, the .NET 8 SDK, and TWS or IB Gateway running with its API enabled |
+
+The commands below are bash; Git Bash on Windows runs them as written. In PowerShell, build with `go build -o gexctl.exe .\cmd\gexctl` and run `.\gexctl.exe serve …` instead.
+
+### Quick start — the dashboard with no TWS
 
 ```bash
 cd core
@@ -60,33 +87,74 @@ go build -o gexctl ./cmd/gexctl
 ./gexctl serve --edge-sim
 ```
 
-Then open http://127.0.0.1:8787. You can change the port through Trader Workstation -> file -? global preferences -> API settings
+Open http://127.0.0.1:8787. `--edge-sim` connects the deterministic edge simulator over the real wire protocol, so the dashboard comes up live immediately — no TWS, no account, no data cost. `Ctrl+C` stops the core and saves the current state, so the charts stay viewable on the next start.
 
-### Before connecting a real account
+### Paper first, then live
 
-Test the software on an Interactive Brokers paper trading (demo) account before pointing it at a live account. Paper TWS listens on port 7497 by default, while live TWS uses 7496, so the only change between the two runs is the `--tws` port. A paper session shows how the edge behaves against real TWS limits, including line counts and pacing, before any of it touches the account that holds your money.
+Test the software on an Interactive Brokers paper trading account before pointing it at a live one. A paper session shows how the edge behaves against real TWS limits — line counts and pacing — before any of it touches the account that holds your money. The only difference between the two runs is the `--tws` port on the edge command.
 
-> **Snapshot sweeps cost money.** If you remove `--no-sweep`, the edge starts snapshot sweeps on its own, and Interactive Brokers charges your account $0.01 for every US equity snapshot, on top of any market-data subscription or commission waiver. Whether index and option snapshots are billed as well depends on your account's data package, so assume they are. A single SPX sweep requests about 1,110 snapshots, sweeps repeat every 45 seconds by default (`--sweep-seconds`), and every restart or GUI Disconnect/Connect fires a fresh first sweep for each ticker. Even with `--no-sweep`, the edge takes one underlying snapshot per ticker each time it starts, to center the strike filter on live spot.
+### Live or paper data
 
-For live data, start the core first, since it has to be listening before the edge connects. Then start the edge next to TWS or IB Gateway (needs the .NET 8 SDK). The command below points at a paper account on port 7497 and keeps sweeps off:
+The one-command path on Windows is `start-gex.ps1` — it starts the dockerized
+core and the edge, opens a Chrome app window on the GUI, reads `watchlist.json`
+for the ticker set on both sides, and logs the edge to `logs/`:
+
+```powershell
+E:\gexProject\start-gex.ps1          # normal start
+E:\gexProject\start-gex.ps1 -Build   # after code changes (rebuilds both sides)
+```
+
+Or start the three pieces manually, in this order:
+
+1. **TWS or IB Gateway, with the API enabled.** In TWS: File → Global Configuration → API → Settings, and check *Enable ActiveX and Socket Clients*. The socket port is 7496 on live TWS and 7497 on paper TWS (IB Gateway: 4001 live, 4002 paper) — the edge's `--tws` flag must match it.
+2. **The core** (terminal 1). It must be listening before the edge connects:
+
+   ```bash
+   cd core
+   ./gexctl serve --edge-addr 127.0.0.1:7878 --db gex.db
+   ```
+
+3. **The edge** (terminal 2), pointing at the paper port:
+
+   ```bash
+   cd edge/src/GexEdge
+   dotnet run -- --core 127.0.0.1:7878 --tws 127.0.0.1:7497 --client-id 11 --tickers SPX,QQQ
+   ```
+
+4. Press **Connect** in the GUI (or start the core with `--connect` to skip the button). Until you do, the page shows the last saved snapshot — but unlike the old behavior, collection itself never stops: the edge streams free data (spot lines, OI rotation, vendor OI) and the journal/db/CSV keep recording regardless of GUI state.
+
+Once the paper run looks right, switch `--tws` to `127.0.0.1:7496` for a live account.
+
+> **Snapshot passes cost money — and only you can start one.** Nothing ever sweeps at boot: the only chain snapshots the edge fires are behind the GUI's Snapshot Sweeper "Run 1 pass" button (max 2 in flight), and each pass is one click = one full-chain pass = chain size × ~$0.01 metered (TSLA/NVDA ≈ $1.75–1.82, VIX ≈ $0.15, SPX ≈ $10.44 — the button shows the price before you press it). Interactive Brokers bills $0.01 per US equity snapshot regardless of waivers; assume index/option snapshots bill too. Passes stop by themselves when done, the kill pill or Disconnect aborts them mid-flight, and boot still takes one cheap underlying snapshot per ticker (~$0.05 total) to center the strike filter on live spot.
+
+### The Beta Hedge panel with real closes (optional)
+
+β needs adjusted daily closes for the pair, loaded into the database before `serve` starts — SQLite is single-owner, so load first, then serve:
 
 ```bash
 cd core
-./gexctl serve --edge-addr 127.0.0.1:7878 --db gex.db
+./gexctl load-closes --ticker PANW --closes panw_closes.csv --db hedge.db
+./gexctl load-closes --ticker CIBR --closes cibr_closes.csv --db hedge.db
+./gexctl serve --db hedge.db --edge-addr 127.0.0.1:7878 --edge-sim --hedge-asset PANW --hedge-bench CIBR --connect
 ```
 
-```bash
-cd edge/src/GexEdge
-dotnet run -- --core 127.0.0.1:7878 --tws 127.0.0.1:7497 --client-id 11 --tickers SPX,NDX --no-sweep
-```
+Against live TWS instead of the simulator, keep the two `load-closes` calls, drop `--edge-sim`, and pass `--hedge-bench CIBR` to the edge so the benchmark rides a real L1 subscription.
 
-Once the paper run looks right, switch `--tws` to `127.0.0.1:7496` for a live account, and leave `--no-sweep` in place unless you have decided the snapshot cost is worth it.
+### Docker
 
 Docker can run the core instead, while the edge stays on the host machine next to TWS.
 
 ```bash
 docker compose up -d --build
 ```
+
+### Ports and security
+
+| Port | What it is | How to change it |
+| --- | --- | --- |
+| 8787 | GUI + JSON/SSE API | `serve --addr` |
+| 7878 | the core ↔ edge wire | `serve --edge-addr` and the edge's `--core` — the two must match |
+| 7496 / 7497 | TWS live / paper socket | TWS Global Configuration → API → Settings — the edge's `--tws` must match |
 
 The HTTP API and the edge port have no authentication, so both bind to localhost only. The GUI rejects requests from any other host or origin unless it is started with `--allow-host`.
 

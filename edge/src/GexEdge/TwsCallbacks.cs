@@ -262,8 +262,11 @@ public sealed class TwsCallbacks : DefaultEWrapper
     {
         // tick type 13 = MODEL_OPTION — the only one with settled surface
         // Greeks; bid/ask are not part of this callback (they ride
-        // tickPrice; passing 0 keeps the core's quote-quality weight neutral)
-        _feed.OnOptionComputation(reqId, tickType, impliedVol, delta, gamma, vega, theta, undPrice);
+        // tickPrice; passing 0 keeps the core's quote-quality weight neutral).
+        // undPrice unset arrives as double.MaxValue — zero it (HasPrice is
+        // tickPrice's guard, same IB convention).
+        _feed.OnOptionComputation(reqId, tickType, impliedVol, delta, gamma, vega, theta,
+            HasPrice(undPrice) ? undPrice : 0);
     }
 
     public override void tickGeneric(int reqId, int tickType, double value)
@@ -291,13 +294,19 @@ public sealed class TwsCallbacks : DefaultEWrapper
         // does not exist yet, so a spot event would bounce as unknown ticker
         if (PendingSpot.TryGetValue(reqId, out var s))
         {
-            if (price > 0 && tickType is 4 or 9) s.TrySetResult(price);
+            if (HasPrice(price) && tickType is 4 or 9) s.TrySetResult(price);
             return;
         }
         // underlying spot from the L1 line: last (4) / close (9) fallback
-        if (tickType is 4 or 9 && price > 0)
+        if (tickType is 4 or 9 && HasPrice(price))
             _feed.OnUnderlyingTick(_feed.CurrentUnderlying(reqId), price);
     }
+
+    /// IB delivers "no value" prices as double.MaxValue — finite, positive,
+    /// and poison downstream (one crashed the core's vol blend live,
+    /// 2026-10-01). Anything implausible for a real underlying is not a
+    /// price.
+    private static bool HasPrice(double v) => v is > 0 and < 1e15;
 
     public override void error(int id, int code, string msg, string advancedOrderReject)
     {

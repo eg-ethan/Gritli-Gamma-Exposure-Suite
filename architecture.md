@@ -54,7 +54,7 @@ Owns exactly these responsibilities and nothing else:
 1. **Connection & pacing:** `clientSocket.SetConnectOptions("+PACEAPI")` BEFORE `eConnect()`; reconnect logic with fresh reqId blocks per session; one clientId.
 2. **Market data line accounting:** track concurrent streaming lines against the 100 base allocation (booster packs extend); every subscription increments/decrements the counter.
 3. **Outbound 50 msg/s pacer:** token bucket spanning ALL request types; PACEAPI as backstop.
-4. **Snapshot sweep engine:** paced queue for regulatory snapshot sweeps across filtered option chains; cost accounting (~$0.01 per snapshot).
+4. **One-pass sweep engine (v2):** GUI-initiated single full-chain pass per ticker (max 2 in flight, `sweep_set` roster + `sweep_done`); paced queue of regulatory snapshots across the filtered chain; cost accounting (~$0.01 per snapshot).
 5. **Tick-by-tick:** reserved exclusively for the 10 underlyings (limit: 1 request per instrument per 15 seconds).
 6. **Chain discovery:** `reqSecDefOptParams` -> expiration traversal (closest expiry >= today; nearest Friday if closest is not a Friday; next Friday; nearest third-Friday monthly) -> publish raw strike list to Go; apply the returned subscription set.
 7. **ActiveRequestMap:** `ConcurrentDictionary<int reqId, ContractMeta>` — runtime only; reqId is NEVER persisted.
@@ -157,7 +157,7 @@ The §4 `gui` bullet named Wails as the shell. Delivered instead as a **localhos
 - **What changed:** the GUI binds to `app.Service` over localhost HTTP + SSE (`/api/state`, `/api/events`, `POST /api/streams`) instead of Wails bindings. `app.Service` is shell-agnostic — a Wails (or Fyne) binding layer can be added later without touching the engine or this service.
 - **Stream control:** the frontend's Connect/Disconnect + per-stream switches (`underlying`, `options`) are the UI surface of the §5 ControlPlane seam. Disconnect freezes the in-memory state and persists the full book + snapshot to SQLite, so the strike-profile bar chart and expiration heatmap stay viewable with no feed — including across restarts (§4 boot reload).
 - **Live data today:** the §3 C# edge does not exist yet; `gexctl serve` feeds `market.Feed` with the deterministic synthetic chain + random-walk spot (the same seam the EdgeStream adapter will plug into). All GUI numbers come from the production pipeline: BS2002 Greeks (with the §4 charm/vanna fixes), OI-baseline dealer inventory, per-contract dollar GEX, walls, and the Brent-refined zero-gamma flip (§4 rootfind port, corrected acceptance condition, now implemented and fuzz-tested).
-- **Watchlist + skew (added 2026-09-07):** the service runs a whole watchlist (SPX/SPXW, NDX/NDXP, VIX/VIXW, TSLA, NVDA, SOXX, GOOG, JPM + one user-set free slot) with per-ticker books, engines, history and persistence. `Contract.IV` carries the quoted per-contract implied vol (the §5 `OptionComputation.impliedVol` field): the skew panel prices deltas at that IV, while exposure stays on the GARCH anchor — the two vol sources are deliberately distinct. Quoted IVs persist in `Option_Contracts.Implied_Vol` (schema migrated in place).
+- **Watchlist + skew (added 2026-09-07; watchlist config file 2026-10-01):** the service runs a whole watchlist (SPX/SPXW, QQQ, VIX/VIXW, TSLA, NVDA, SOXX, GOOG, JPM + one user-set free slot) with per-ticker books, engines, history and persistence. The compiled default is overridable by a JSON config file (`serve --watchlist watchlist.json`, `{"tickers":["SPX","QQQ",…]}`; docker-compose mounts the repo's `watchlist.json` read-only) — the same file `start-gex.ps1` reads for the edge's `--tickers`, so the GUI rows and the edge coverage never drift apart. QQQ replaced NDX in the default set (2026-10-01): the equity routes SMART (no index-line entitlement trouble) and its one-pass sweep is equity-priced. `Contract.IV` carries the quoted per-contract implied vol (the §5 `OptionComputation.impliedVol` field): the skew panel prices deltas at that IV, while exposure stays on the GARCH anchor — the two vol sources are deliberately distinct. Quoted IVs persist in `Option_Contracts.Implied_Vol` (schema migrated in place).
 
 ## 9. Build Status & Methodology Changes (2026-09-07)
 
@@ -269,7 +269,7 @@ Cross-compiles `gexctl` for the five §8 targets into `dist/gexsuite-{os}-{arch}
 | §10.4 gap | Status as of 2026-09-18 |
 | --- | --- |
 | Live-TWS validation | underway — edge compiled and live-probed (§11.3); full validation continues |
-| C# snapshot-sweep engine | shipped in source; `--no-sweep` is the recommended cost posture ($0.01/snapshot, ≈1,110 per SPX sweep, 45-s default cadence) |
+| C# snapshot-sweep engine | v2 (2026-10-01): on-demand ONE-PASS sweeps only — GUI "Run 1 pass" button, max 2 in flight, `sweep_done` auto-stop; nothing sweeps at boot (`--no-sweep`/`--sweep-seconds` are no-ops); GUI freeze/pause machinery removed — collection runs continuously, Disconnect aborts passes but not collection |
 | Boot `reqHistoricalData` baseline-IV wiring in TwsFeed | still a placeholder (`BaselineIv = 0.20` + seed spot) |
 | Nightly fit-job scheduling + closes data source | scheduling closed (§11.5); closes CSV sourcing stays manual |
 | GUI rendering of `Snapshot.Classes` | closed — `panel-classes` strip renders per-class cards from `/api/state` |
@@ -295,4 +295,80 @@ Same date, documentation alignment executed (the audit's corrections): edge/READ
 
 **Phase 2 landed (2026-09-19):** the positions layer, the hedge engine, and the GUI panel. `internal/hedge` gained `ErrInsufficientHistory` (the deferred sentinel: `ComputeStats` wraps it, the state layer `errors.Is`-maps it), `USSession` (the ET boundary clock — key = ET yyyyMMdd because a US session spans two UTC days; regular hours [09:30, 16:00) America/New_York; the serve binary imports `_ "time/tzdata"` so the location resolves on Windows and static Linux), and the `Leg` type with validation. Schema v7 adds `Positions` (manual portfolio; option legs resolve by conId else class/expiry/right/strike — unresolved is a flagged state, never fatal) and `Hedge_Pair` (single row; `--hedge-asset/--hedge-bench` seed it, a stored pair wins). The delta seam is `exposure.ContractDeltas` + `Engine.PricingInputs()`: legs price through the IDENTICAL volblend→BS2002 pipeline the engine's own snapshots use, with the blend built once per recompute — no duplicated wiring to drift; IBKR model deltas ride `Current_Market_State` as the reference column (cached ≤2 s on the single store conn). The `app.Service` sub-service owns the state machine (`no_pair > no_positions > insufficient_history > no_beta > no_asset_feed > no_bench_feed > stale_feed > ok`): β recomputes lazily at each new ET session and on restart from `Daily_Closes` (never persisted as truth), the 60 s staleness gate arms only in regular hours and RETAINS the last target grayed rather than zeroing it, and the simulator walks a spot-only benchmark (deterministic fabricated spot for unknown symbols — the Phase-3 edge L1 replaces it). Surface: `GET /api/hedge` (+`hedge` SSE broadcasts on mutations), `POST /api/hedge-pair`, `POST /api/positions`, `DELETE /api/positions/{id}`; the guard now requires JSON Content-Type only on body-carrying methods (bodyless DELETE is preflight-gated anyway). GUI: a Beta Hedge rail panel — pair form (asset constrained to watchlist tickers), β/ρ/N/σ stats with the <200 flag, target-shares/notional/Δ$ tiles, Δ_net, and the manual legs editor with per-leg solver delta, IBKR reference, share-equivalent, and unresolved flags. Verified live: constructed β 0.8 recovered as 0.800005 over 260 sessions; long 100 TSLA → **−140 CIBR target** (short hedge, half-away rounding); delete returns `no_positions`; a non-watchlist asset rejects 409. State-machine tests cover the full precedence chain, staleness (mid-session injected clock), flag-vs-stored seeding, boot reload (pair + legs + recomputed β), and the sim bench walk. `go build ./... && go vet ./... && go test ./... -count=1` clean; linux/darwin cross-compiles clean. Known Phase-3 work: the real benchmark spot arrives with the edge's spot-only ticker; the GUI panel polls at 2 s (SSE events fire only on mutations).
 
-**Phase 3 landed (2026-09-19):** the real benchmark L1 line over the wire, on all three surfaces (Go core, Go sim, C# edge). Protocol, additive in v1: `spot_sub` (edge→core, `{ticker}`) announces the spot-only benchmark; `spot_ack` (core→edge) confirms, correlated by Id like chain→`sub_set`, ticker uppercased (`internal/edge/proto.go`). Ingest keeps a `spotOnly` registry — a registered ticker's L1 spots apply with no chain ever expected and no unknown-ticker anomaly; a malformed registration is answered `bad_ticker` with the session kept alive. `Service.ApplySpot` routes the benchmark (ticker == the stored pair's bench, no watchlist handle) straight into `benchSpot/benchSpotMs` — the edge's real L1 replacing the Phase-2 simulator walk. The Go sim (`--edge-sim`) announces the bench via `spot_sub` whenever the stored pair's benchmark is not itself a watchlist ticker, then walks its L1. The C# edge gains `--hedge-bench SYM`: `TwsFeed.SpotOnlyAsync` registers FIRST (a line that beats its registration can never draw an anomaly), resolves the contract definition with the exchange routed from the RESOLVED contract rather than the requested one, and holds exactly one permanent L1 line — no discovery, no `sub_set`, no sweeps, no OI rotation; `SimulatedFeed` mirrors the same path in `--simulate`, and `CoreConnection` tolerates `spot_ack`. Verified three ways: live smoke (`--edge-sim`, TSLA/CIBR closes loaded) — state `ok`, β 0.800005, bench spot advancing over the wire, target −140, zero CIBR anomalies; offline — `gexctl replay` of the recorded 28k-event session reproduces the final bench spot (201.85) and the live β/target exactly, and the same journal replayed WITHOUT the stored pair counts all 140 bench spots as apply errors (with the pair they all land — the routing is the pair's doing); conformance — `docs/_verify/edge_protocol_conformance.py` is now 12/12 (spot_sub ack by id + uppercase, registered spot no-error, unregistered spot tolerated). The smoke review's one open question — a bench spot that seemed to advance after GUI Disconnect — was investigated and closed NOT-A-LEAK: the feeds gate sits before dispatch, so it covers the spot-only path like every other inbound event (live repro: bench pinned at its last value for 16 s+ after Disconnect while the pause-ignoring Go sim kept sending); the journal shows the observed final spot landed 110 ms BEFORE the `pause` push, i.e. pre-disconnect streaming. Pinned by `TestFeedsGateFreezeSpotOnly`. Documented trade-offs: the bench subscription is edge-flag-driven — a GUI pair change to a NEW benchmark does not reach a running edge (restart it with the new `--hedge-bench`; the core tolerates any registered spot-only ticker); and the Go sim ignores `pause`/`resume` (its readLoop answers `sub_set`/`error`/`spot_ack` only) — the C# edge tears down on pause, and the core's dispatch gate is the backstop either way. `go build ./... && go vet ./... && go test ./... -count=1` clean across all 13 packages; linux/amd64 + darwin/arm64 cross-compiles clean; the C# edge builds clean with its console suite green.
+**Phase 3 landed (2026-09-19):** the real benchmark L1 line over the wire, on all three surfaces (Go core, Go sim, C# edge). Protocol, additive in v1: `spot_sub` (edge→core, `{ticker}`) announces the spot-only benchmark; `spot_ack` (core→edge) confirms, correlated by Id like chain→`sub_set`, ticker uppercased (`internal/edge/proto.go`). Ingest keeps a `spotOnly` registry — a registered ticker's L1 spots apply with no chain ever expected and no unknown-ticker anomaly; a malformed registration is answered `bad_ticker` with the session kept alive. `Service.ApplySpot` routes the benchmark (ticker == the stored pair's bench, no watchlist handle) straight into `benchSpot/benchSpotMs` — the edge's real L1 replacing the Phase-2 simulator walk. The Go sim (`--edge-sim`) announces the bench via `spot_sub` whenever the stored pair's benchmark is not itself a watchlist ticker, then walks its L1. The C# edge gains `--hedge-bench SYM`: `TwsFeed.SpotOnlyAsync` registers FIRST (a line that beats its registration can never draw an anomaly), resolves the contract definition with the exchange routed from the RESOLVED contract rather than the requested one, and holds exactly one permanent L1 line — no discovery, no `sub_set`, no sweeps, no OI rotation; `SimulatedFeed` mirrors the same path in `--simulate`, and `CoreConnection` tolerates `spot_ack`. Verified three ways: live smoke (`--edge-sim`, TSLA/CIBR closes loaded) — state `ok`, β 0.800005, bench spot advancing over the wire, target −140, zero CIBR anomalies; offline — `gexctl replay` of the recorded 28k-event session reproduces the final bench spot (201.85) and the live β/target exactly, and the same journal replayed WITHOUT the stored pair counts all 140 bench spots as apply errors (with the pair they all land — the routing is the pair's doing); conformance — `docs/_verify/edge_protocol_conformance.py` is now 12/12 (spot_sub ack by id + uppercase, registered spot no-error, unregistered spot tolerated). The smoke review's one open question — a bench spot that seemed to advance after GUI Disconnect — was investigated and closed NOT-A-LEAK: the feeds gate sits before dispatch, so it covers the spot-only path like every other inbound event (live repro: bench pinned at its last value for 16 s+ after Disconnect while the pause-ignoring Go sim kept sending); the journal shows the observed final spot landed 110 ms BEFORE the `pause` push, i.e. pre-disconnect streaming. Pinned by `TestFeedsGateFreezeSpotOnly`. Documented trade-offs: the bench subscription is edge-flag-driven — a GUI pair change to a NEW benchmark does not reach a running edge (restart it with the new `--hedge-bench`; the core tolerates any registered spot-only ticker); and the Go sim ignores `pause`/`resume` (its readLoop answers `sub_set`/`error`/`spot_ack` only) — the C# edge tears down on pause, and the core's dispatch gate is the backstop either way. `go build ./... && go vet ./... && go test ./... -count=1` clean across all 13 packages; linux/amd64 + darwin/arm64 cross-compiles clean; the C# edge builds clean with its console suite green. Post-landing live validation (2026-09-19, weekend session against live TWS on 7496) closed the one live check the phasing had deferred — the bench L1 line on a real account: a PANW/CIBR pair with 1,255 overlapping adjusted closes loaded (β 1.26, ρ 0.76), `--hedge-bench CIBR` brought the spot-only line up with zero anomalies and the panel computing end to end (operator-confirmed). A regular-hours session — the staleness gate's live path — is the only unexercised branch, covered by the injected-clock state-machine test.
+
+## 13. Protocol v2 — On-Demand One-Pass Sweeps & Live-Hardening (2026-10-01)
+
+**Sweeps are one-pass, GUI-initiated, never at boot.** The repeating sweep
+engine (and the boot-time full-watchlist first pass, ≈$26–28 metered) is
+deleted from the C# edge. Protocol bumped to **v2** (the version gate rejects
+a mixed core/edge pair loudly — a stale v1 edge can no longer silently ignore
+the roster): `SweepEntry` lost `intervalSeconds` (an entry IS one pass
+request), and the edge answers each with a new **`sweep_done {ticker, ok,
+reason?, requested}`**. The core's roster is the authoritative in-flight set
+(set semantics; empty aborts everything; pushed on every hello so a core
+restart stops a stale edge — fail-closed). `sweep_policy.go` remains the one
+tuning surface: cap 2 concurrent passes, ET shutoff windows (SPX/NDX
+09:20:00–16:09:59, else 08:15–18:30, weekends blocked, sticky clear), and
+the per-pass price/duration estimates the GUI renders on the button
+(SPX $10.44, TSLA $1.75, NVDA $1.82, SOXX $0.76, GOOG $1.00, JPM $0.52, VIX
+$0.15; unobserved tickers show "≈ $0.01 × chain"). The C# edge mirrors the
+hard limits in `edge/src/GexEdge/SweepPolicy.cs` — the edge is the billing
+process and re-clamps/re-checks whatever the core pushes. `TwsFeed.PassOnceAsync`
+waits (bounded) for discovery and a live TWS socket, runs exactly one
+`RunPassAsync` over the stored filtered chain, and reports honestly (a pass
+that fires zero snapshots is a refused `sweep_done`, never a fake success).
+The GUI sweeper panel renders a priced "Run 1 pass" button per watchlist
+ticker (live metered-spend delta and a "roughly N min" disclaimer banner
+while running, "fresh as of" timestamp after), row-level Stop, a kill pill
+that aborts everything in flight, and no repeating-interval control at all.
+`--no-sweep`/`--sweep-seconds` are accepted no-ops for old scripts.
+
+**Collection never pauses for GUI state.** The feeds-freeze gate, the
+hidden-tab auto-disconnect, and the pause-on-Disconnect teardown are removed;
+`pause`/`resume` remain on the wire as unsent defensive dead code (the edge
+aborts in-flight passes cleanly if one ever arrives). Hiding/closing the GUI
+changes nothing — L1 lines, OI rotation, vendor OI, the journal, SQLite, and
+the master CSV run continuously. The GUI's Disconnect button is re-scoped:
+it aborts every in-flight pass (kill-pill semantics via `ClearSweeps`) and
+drops the live view; it never stops collection.
+
+**The 2026-10-01 live crash is fixed and replay-proven.** The core panicked
+in `exposure.blendedVols` (nil `best`) on the live NDX book: an unset TWS
+price arrives as C# `double.MaxValue` (finite and positive, so every `> 0`
+guard passed), and at that magnitude `|strike − spot|` rounds back to exactly
+`MaxFloat64`, so the ATM-nearest-strike comparison never fires. Fixed at
+three layers: the C# edge rejects implausible prices at the callback
+(`HasPrice`, tickPrice boot-spot + L1, optcomp `undPrice` zeroed), the Go
+ingest and `market` book reject non-sane spots (`saneSpot`/`saneSpotPrice`:
+finite, > 0, < 1e9) for spot events, optcomp undPrice, and chain snapshots,
+and `blendedVols` skips a group with no resolvable ATM reference instead of
+dereferencing nil — bad data can never take the process down again. Verified
+by replaying the exact 301k-record v2 session journal that crashed the live
+core: it now completes cleanly (`gexctl replay`, exit 0).
+
+**Also shipped:** QQQ replaced NDX in the default watchlist and the
+`watchlist.json` config file drives both sides (`serve --watchlist`, compose
+mount, `start-gex.ps1` reads it for `--tickers`); the master CSV flush moved
+30 m → 5 m (smaller, smoother bursts) and the live DB checkpoint 30 s → 5 min
+(`app.PersistEvery`; Disconnect/shutdown still persist in full, and the
+journal remains the complete recovery path); `start-gex.ps1` is the one-command
+session launcher (variables at top, stale-`gex-edge` kill — the root cause of
+the live session churn was a leftover edge process holding TWS clientId 11 —
+`-Build` switch for post-change rebuilds, Chrome app window to the GUI, edge
+stderr to `logs/edge-*.log`); optcomp events now stamp `src: snap|stream` so
+the master log's Source column is truthful.
+
+**Verification (all free — no paid snapshots fired):** `go vet` + `go test ./...`
+green across every package (one pre-existing, date-sensitive selection test
+fails identically on unmodified HEAD — October 1st follows the September
+monthly expiry); new pins: one-pass roster flow (hello-empty push → set push →
+`sweep_done` retires + re-pushes the shrunken roster → heartbeat `sweepActive`
+marks sweeping rows → kill pushes empty), cap/window refusals with operator
+reasons, collection-never-pauses, and the httpui sweeps surface (POST sets,
+kill, Disconnect-kills-sweeps, reconnect arms nothing). Conformance script
+extended to 16/16 against a live core (empty roster push on hello,
+`sweep_done` tolerated, wrong-version rejection). End-to-end over the wire
+with zero TWS: the Go sim and the real C# edge in `--simulate` both ran
+click → sweeping → auto-idle → freshness-stamped rows. The C# edge builds
+clean (0 warnings).

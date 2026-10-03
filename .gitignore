@@ -20,13 +20,14 @@ __pycache__/
 # personal tool state
 .obsidian/
 .zcode/
+.firecrawl/
+.zcodeignore
 
 # local ops config — holds machine-specific paths to the db and closes CSVs;
 # commit fit-tickers.example.json instead
 ops/fit-tickers.json
 ops/logs/
 
-# third-party copyrighted material
-.firecrawl/
+# third-party material
 ssrn-PDTS.pdf
 AI-Visibility-Research-Report-2026.pdf

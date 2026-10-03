@@ -6,13 +6,16 @@ proto.go) and implemented three times: the Go server, the C# edge service
 (edge/src/GexEdge), and this script. Conformance = this script, written from
 the proto.go spec, can drive the REAL Go server end to end:
 
-    hello  -> welcome
+    hello  -> welcome, then the (empty) one-pass sweep roster push
     chain  -> sub_set (selection math the core owns)
     spot_sub -> spot_ack (hedge benchmark registration; its spot applies
                with no chain)
+    sweep_done (a pass outcome) is accepted and tolerated for unknown
+               tickers (abort racing its roster removal)
     optcomp patches land in the book (spot observable via /api/state or the
              app book)
-    seq gaps and malformed lines are detected server-side
+    seq gaps, wrong protocol versions, and malformed lines are detected
+    server-side
     the session journals to JSONL and `gexctl replay` reproduces it
 
 Run it against a live core:
@@ -33,7 +36,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-PROTO = 1
+PROTO = 2
 MAX_LINE = 1 << 20
 
 
@@ -129,11 +132,16 @@ def main() -> int:
 
     cli = EdgeClient(host, int(port))
 
-    # 1. handshake: hello -> welcome, session assigned, protocol echoed
+    # 1. handshake: hello -> welcome, session assigned, protocol echoed —
+    #    then the EMPTY one-pass roster push (fail-closed: nothing is armed
+    #    without the GUI's say-so, so a fresh core stops a stale edge)
     cli.send("hello", {"instance": cli.instance, "caps": ["conformance"]})
     welcome = cli.expect("welcome")["data"]
     check("hello/welcome handshake", bool(welcome.get("session")) and welcome.get("proto") == PROTO,
           f"session={welcome.get('session')}")
+    roster = cli.expect("sweep_set")["data"]
+    check("hello answers with empty roster push", roster.get("tickers") == [],
+          f"tickers={roster.get('tickers')}")
 
     # 2. chain discovery -> sub_set: the monthly is kept under BOTH classes,
     #    the strike window matches the 2SD filter over the universe
@@ -212,6 +220,35 @@ def main() -> int:
     cli.send("spot", {"ticker": "NOCHN", "price": 10.0})
     cli.send("ping")
     check("unregistered spot keeps session alive", cli.expect("pong").get("type") == "pong")
+
+    # 9. sweep_done (v2): a pass outcome the core accepts — one for a ticker
+    #    not in the roster (an abort racing its roster removal) is tolerated
+    #    with no error reply, and the session stays alive
+    cli.send("sweep_done", {"ticker": "VIX", "ok": True, "requested": 14})
+    cli.send("ping")
+    check("sweep_done accepted (not-in-roster tolerated)", cli.expect("pong").get("type") == "pong")
+    cli.send("sweep_done", {"ticker": "TSLA", "ok": False, "reason": "aborted"})
+    cli.send("ping")
+    check("aborted sweep_done accepted", cli.expect("pong").get("type") == "pong")
+
+    # 10. wrong protocol version -> bad_envelope error (the v2 gate: a mixed
+    #     core/edge pair is rejected loudly, never silently ignored)
+    cli.f.write(json.dumps({"v": PROTO + 1, "seq": cli.seq + 1, "type": "ping",
+                            "ts": int(time.time() * 1000)}).encode() + b"\n")
+    cli.f.flush()
+    ver_err = None
+    try:
+        while True:
+            env = cli.recv()
+            if env.get("type") == "error":
+                ver_err = env
+                break
+            if env.get("type") == "pong":
+                break
+    except (EOFError, TimeoutError):
+        pass
+    check("wrong protocol version rejected", ver_err is not None and ver_err["data"]["code"] == "bad_envelope",
+          str(ver_err["data"]) if ver_err else "no error reply")
 
     cli.close()
 

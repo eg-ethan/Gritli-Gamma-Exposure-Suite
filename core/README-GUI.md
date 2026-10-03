@@ -31,6 +31,7 @@ Then open **http://127.0.0.1:8787** in any browser.
 | `--seed` | `42` | simulator RNG seed (chain layout is seed-stable per day) |
 | `--edge-addr` | *(off)* | listen address for the edge ingest protocol — the C# edge service connects here |
 | `--edge-sim` | off | connect the built-in deterministic edge simulator to `--edge-addr` (no TWS needed); implies `--connect` |
+| `--watchlist FILE` | JSON watchlist config (`{"tickers":["SPX","QQQ",…]}`) that replaces the compiled defaults; docker-compose mounts the repo's `watchlist.json`, and `start-gex.ps1` reads the same file for the edge's `--tickers` |
 | `--journal FILE` | *(off)* | record the edge session as JSONL for later `gexctl replay` |
 | `--oi-vendor` | `cboe` | vendor open-interest source for TWS accounts whose feed delivers no option OI (`cboe` or `none`) |
 | `--hedge-asset` | *(off)* | hedge module asset — must be a watchlist ticker (it needs a chain); seeds the pair, a stored pair wins |
@@ -38,8 +39,11 @@ Then open **http://127.0.0.1:8787** in any browser.
 
 ## Watchlist
 
-The header strip covers **SPX** (SPXW options), **NDX** (NDXP), **VIX** (VIXW),
-**TSLA**, **NVDA**, **SOXX**, **GOOG** and **JPM**, plus one **free slot**.
+The header strip covers **SPX** (SPXW options), **QQQ**, **VIX** (VIXW),
+**TSLA**, **NVDA**, **SOXX**, **GOOG** and **JPM**, plus one **free slot**
+(QQQ replaced NDX on 2026-10-01). The set comes from `watchlist.json` at the
+repo root — edit it once and both the GUI rows and the edge's coverage follow
+(the compiled defaults above apply only when the file is not passed).
 Click any ticker to switch the whole dashboard to it (every entry streams and
 keeps its own intraday history). The free slot — the `✎` entry, or `＋ free`
 when unset — accepts any ticker: click it, type a symbol, press Set, and it
@@ -81,10 +85,14 @@ an `iv` column.
   profile and the ΔGEX history all update live.
 - The two per-stream switches under **Data Streams** control the underlying
   tick feed and the option-chain/OI feed independently.
-- Press **Disconnect** (or flip both switches off): updates stop, the view
-  freezes, and the full state is saved to SQLite. The charts keep rendering —
-  including after you quit and restart the app — exactly as of the
-  **Saved as of** timestamp shown in the panel.
+- Press **Disconnect** (or flip both switches off): the view freezes, the
+  full state is saved to SQLite, and — with a real edge attached — every
+  in-flight snapshot sweep is aborted. Collection itself never stops: the
+  edge keeps streaming free data and the journal/db/master CSV keep
+  recording regardless of GUI state (hiding or closing the tab changes
+  nothing). The charts keep rendering — including after you quit and
+  restart the app — exactly as of the **Saved as of** timestamp shown in
+  the panel.
 - Session state is also checkpointed periodically while live and on shutdown
   (Ctrl+C), so a crash loses at most a few seconds.
 
@@ -129,12 +137,25 @@ as the reference and unresolved legs flagged instead of failing.
 
 The target is `Q = −round(β·Δ_net·S_asset / S_bench)` — a long book hedges
 SHORT in the benchmark. β is raw OLS over a 252-session trailing window of
-**adjusted** daily closes, which must be loaded first:
+**adjusted** daily closes, which must be loaded first (before `serve` starts
+— SQLite is single-owner):
 
 ```bash
-gexctl load-closes --ticker TSLA --closes TSLA_closes.csv --db gex.db
-gexctl load-closes --ticker CIBR --closes CIBR_closes.csv --db gex.db
+gexctl load-closes --ticker PANW --closes panw_closes.csv --db gex.db
+gexctl load-closes --ticker CIBR --closes cibr_closes.csv --db gex.db
 ```
+
+Closes come from any daily-history vendor (Yahoo's "Adj Close" or Stooq's
+daily data both work) as strict two-column `date,close` files with split-
+and dividend-adjusted values; ≥ 200 overlapping sessions are required or
+the panel reports `insufficient history` with the count it found.
+
+Two wiring requirements worth knowing: the ASSET must be a watchlist ticker
+**and** covered by the edge's `--tickers` (its chain feeds the leg Greeks —
+an asset with no chain shows `no asset feed`), and option legs must use an
+expiry that actually exists in that chain (equity monthlies expire on
+Fridays — a leg matching no contract stays flagged `unresolved` rather than
+guessing).
 
 The state badge carries the machine's verdict, and every failure is explicit
 rather than a zero: `insufficient history` (N < 200 overlapping sessions,

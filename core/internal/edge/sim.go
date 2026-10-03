@@ -317,6 +317,19 @@ func (s *simClient) readLoop() error {
 			s.mu.Unlock()
 		case TypeSpotAck:
 			// registration landed; spots may flow
+		case TypeSweepSet:
+			// the roster is one-pass semantics now: each entry is a request
+			// for ONE simulated pass — report it done after a short delay so
+			// the GUI sweeper is exercisable end to end under --edge-sim
+			var set SweepSet
+			if err := json.Unmarshal(env.Data, &set); err != nil {
+				continue
+			}
+			for _, e := range set.Tickers {
+				go s.simPass(e.Ticker)
+			}
+		case TypePause, TypeResume:
+			// (v2) never sent by the core; tolerated defensively
 		case TypeError:
 			var e ErrorMsg
 			if json.Unmarshal(env.Data, &e) == nil {
@@ -325,6 +338,29 @@ func (s *simClient) readLoop() error {
 		}
 	}
 	return sc.Err()
+}
+
+// simPass plays one one-pass sweep: a brief "sweeping" heartbeat, then the
+// sweep_done the real edge would send. The reported contract count is the
+// ticker's subscribed book size (0 before the sub_set lands — the refusal
+// shape an un-discovered ticker produces on the real edge).
+func (s *simClient) simPass(ticker string) {
+	s.mu.Lock()
+	_ = s.send(TypeStatus, 0, StatusEvent{Connected: true, SweepActive: []string{ticker}})
+	_ = s.w.Flush()
+	s.mu.Unlock()
+
+	time.Sleep(2 * time.Second)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	requested := 0
+	if sub := s.keep[ticker]; sub != nil {
+		requested = len(s.books[ticker])
+	}
+	_ = s.send(TypeSweepDone, 0, SweepDone{Ticker: ticker, Ok: true, Requested: requested})
+	_ = s.send(TypeStatus, 0, StatusEvent{Connected: true})
+	_ = s.w.Flush()
 }
 
 // tick emits one spot tick + a rotating slice of optcomp updates per ticker,

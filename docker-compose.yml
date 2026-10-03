@@ -4,23 +4,28 @@
 #   docker compose logs -f gex-core
 #   docker compose down            (add -v to wipe the saved state)
 #
-# Status (2026-09-09): wired for the LIVE C# edge. The core listens for the
-# edge protocol on 7878 (0.0.0.0 + port mapping, same pattern as the GUI
-# port) and journals every wire line to /data/live.jsonl for gexctl replay.
-# The synthetic feed is OFF. Vendor OI (CBOE) is on by default — this TWS
-# account streams no option OI. GUI Disconnect pauses the EDGE (core pushes
-# `pause`; the edge tears its TWS session down — no snapshot/line spend
-# while the GUI is frozen); a hidden GUI tab auto-disconnects after 10s.
+# Status (2026-10-01, protocol v2): wired for the LIVE C# edge. The core
+# listens for the edge protocol on 7878 (0.0.0.0 + port mapping, same
+# pattern as the GUI port) and journals every wire line to /data/live.jsonl
+# for gexctl replay. The synthetic feed is OFF. Vendor OI (CBOE) is on by
+# default — this TWS account streams no option OI. NOTHING ever sweeps at
+# boot: chain snapshots happen only behind the GUI's "Run 1 pass" button
+# (max 2 in flight, one full-chain pass per click, auto-stop). Collection
+# (spot lines, OI rotation, vendor OI, journal/db/CSV) runs continuously
+# regardless of GUI state; the GUI's Disconnect aborts in-flight passes but
+# never stops collection. A stale v1 edge is rejected at the version gate —
+# rebuild both sides together.
 #
-# Start the Windows-side edge in NO-SNAPSHOT mode (rotation-only — the OI
-# rotation's streaming lines carry Greeks/IV; live spot via underlying L1
-# lines; GEX positions from CBOE vendor OI):
+# Start the Windows-side edge (rotation-only boot; sweeps on demand):
 #
 #   edge/src/GexEdge/bin/Debug/net8.0/win-x64/gex-edge.exe \
 #       --core 127.0.0.1:7878 --tws 127.0.0.1:7496 --client-id 11 \
-#       --tickers SPX,NDX,VIX,TSLA,NVDA,SOXX,GOOG,JPM --no-sweep
+#       --tickers SPX,QQQ,VIX,TSLA,NVDA,SOXX,GOOG,JPM
 #
-# (drop --no-sweep to re-enable the snapshot-sweep engine; see edge/README.md.)
+# (start-gex.ps1 builds the --tickers list from the same watchlist.json the
+# core reads — prefer the launcher over this hand-typed example.)
+#
+# (--no-sweep/--sweep-seconds are accepted no-ops; see edge/README.md.)
 
 services:
   gex-core:
@@ -35,12 +40,15 @@ services:
       - "127.0.0.1:7878:7878"
     volumes:
       - gex-data:/data
+      # the ONE place the watchlist is edited: the core reads it for the GUI
+      # rows and start-gex.ps1 reads the same file for the edge's --tickers
+      - ./watchlist.json:/data/watchlist.json:ro
     # --addr/--edge-addr 0.0.0.0 are required to be reachable through the
     # port mappings (the flags' localhost defaults are container-internal
     # only); --connect starts with streams connected so the edge's data
     # applies as soon as it arrives (no manual GUI Connect needed). Vendor
     # OI (CBOE) is on by default — this TWS account streams no option OI
-    command: ["serve", "--addr", "0.0.0.0:8787", "--edge-addr", "0.0.0.0:7878", "--db", "/data/gex.db", "--journal", "/data/live.jsonl", "--connect"]
+    command: ["serve", "--addr", "0.0.0.0:8787", "--edge-addr", "0.0.0.0:7878", "--db", "/data/gex.db", "--journal", "/data/live.jsonl", "--watchlist", "/data/watchlist.json", "--connect"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/api/state"]

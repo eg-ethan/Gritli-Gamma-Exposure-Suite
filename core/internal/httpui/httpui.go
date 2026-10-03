@@ -67,12 +67,12 @@ func (s *Server) SetDiagnostics(fn func() any) { s.diagnostics = fn }
 
 // SweepsAPI is the sweep-control surface served at /api/sweeps, composed by
 // the serve wiring (edge server roster + master-log state). View renders the
-// GET read model; Apply installs a full roster (set semantics — the error is
-// an *edge.SweepError carrying the operator reason for the 409 body); Kill
-// deselects everything.
+// GET read model; Apply installs the full in-flight ticker set (set
+// semantics — the error is an *edge.SweepError carrying the operator reason
+// for the 409 body); Kill aborts everything in flight.
 type SweepsAPI struct {
 	View  func() any
-	Apply func(entries []edge.SweepEntry) error
+	Apply func(tickers []string) error
 	Kill  func() error
 }
 
@@ -177,9 +177,10 @@ func (s *Server) handlePositionDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.svc.Hedge())
 }
 
-// handleSweepsGet renders the sweeper read model: per-ticker armed/sweeping/
-// allowed/reason/opensAt rows, interval+cost options, the live edge
-// heartbeat, and the master-log countdown state.
+// handleSweepsGet renders the sweeper read model: per-ticker pending/
+// sweeping/allowed/reason/opensAt rows with per-pass price + duration
+// estimates and last-pass freshness, the live edge heartbeat, and the
+// master-log countdown state.
 func (s *Server) handleSweepsGet(w http.ResponseWriter, _ *http.Request) {
 	if s.sweeps == nil || s.sweeps.View == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
@@ -188,22 +189,23 @@ func (s *Server) handleSweepsGet(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.sweeps.View())
 }
 
-// handleSweepsPost is the sweep control surface:
+// handleSweepsPost is the sweep control surface (one-pass semantics):
 //
-//	POST {"tickers": [{"ticker": "SPX", "intervalSeconds": 60}]} — install the
-//	     FULL roster (empty array = deselect all)
-//	POST {"kill": true}                               — same as an empty roster
+//	POST {"tickers": ["TSLA","NVDA"]} — the FULL in-flight set. Added tickers
+//	     start their one full-chain pass; removed tickers are aborted
+//	     mid-flight. Empty array = deselect all (same as kill).
+//	POST {"kill": true}               — abort everything in flight
 //
-// Rejects land as 409 with the operator reason inline (blocked window, cap,
-// bad interval); the roster is left untouched on any reject.
+// Rejects land as 409 with the operator reason inline (blocked window, cap);
+// the roster is left untouched on any reject.
 func (s *Server) handleSweepsPost(w http.ResponseWriter, r *http.Request) {
 	if s.sweeps == nil || s.sweeps.Apply == nil {
 		writeErr(w, http.StatusConflict, "sweep control requires the edge boundary (--edge-addr)")
 		return
 	}
 	var req struct {
-		Tickers []edge.SweepEntry `json:"tickers"`
-		Kill    bool              `json:"kill"`
+		Tickers []string `json:"tickers"`
+		Kill    bool     `json:"kill"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad json body")
@@ -341,6 +343,11 @@ func (s *Server) handleWatchlistSet(w http.ResponseWriter, r *http.Request) {
 
 // handleStreams is the connect/disconnect control surface:
 // POST {"stream": "underlying"|"options"|"all", "connect": true|false}
+//
+// Disconnect (connect=false) ALSO stops all sweeps: the edge keeps streaming
+// free data (L1 lines, OI rotation, vendor OI) and collection (journal/db/
+// master CSV) continues — Disconnect's sweep kill is the "stop paying"
+// action, not a feed pause.
 func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Stream  string `json:"stream"`
@@ -358,6 +365,12 @@ func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
 	if err := s.svc.SetStream(id, req.Connect); err != nil {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
+	}
+	if !req.Connect && s.sweeps != nil && s.sweeps.Kill != nil {
+		if err := s.sweeps.Kill(); err != nil {
+			writeErr(w, http.StatusInternalServerError, "stream disconnected but sweep kill failed: "+err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, s.svc.Status())
 }
