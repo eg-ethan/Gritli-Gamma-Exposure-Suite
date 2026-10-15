@@ -12,6 +12,19 @@ $targets = @(
     @{ os = "darwin";  arch = "arm64"; ext = "" }
 )
 
+if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+    $localGo = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.tools\go\bin"))
+    if (Test-Path (Join-Path $localGo "go.exe")) {
+        $env:PATH = "$localGo;$env:PATH"
+    }
+}
+
+$tmpDir = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.tmp"))
+if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory -Force $tmpDir | Out-Null }
+$env:GOTMPDIR = $tmpDir
+$env:TMP = $tmpDir
+$env:TEMP = $tmpDir
+
 if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 New-Item -ItemType Directory -Force dist | Out-Null
 
@@ -23,6 +36,7 @@ foreach ($t in $targets) {
     $env:GOOS = $t.os
     $env:GOARCH = $t.arch
     go build -trimpath -ldflags "-s -w" -o (Join-Path dist "$dir\gexctl$($t.ext)") ./cmd/gexctl
+    if ($LASTEXITCODE -ne 0) { throw "go build failed for $dir with exit code $LASTEXITCODE" }
     if (Test-Path "README-GUI.md") { Copy-Item "README-GUI.md" (Join-Path dist "$dir\") }
 }
 

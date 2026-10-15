@@ -2,6 +2,8 @@
 
 GEX Suite measures gamma exposure (GEX) on index and equity options from live Interactive Brokers data, and shows where dealer hedging is likely to push price toward or away from a level.
 
+![GEX Suite Dashboard](images/gex-suite-dashboard.png)
+
 ## Why gamma exposure moves price
 
 The starting point is the options dealer. A market maker who sells an option doesn't want to bet on direction, so they hedge by trading the underlying. How much they trade depends on delta, and how fast that delta changes as price moves depends on gamma. Because every dealer holding gamma has to re-hedge each time spot moves, the combined hedging across a whole options chain becomes real buying and selling in the underlying.

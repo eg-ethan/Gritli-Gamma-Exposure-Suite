@@ -1,8 +1,9 @@
 # toolchain / build output
 .tools/
+.tmp/
 **/bin/
 **/obj/
-core/dist/
+**/dist/
 *.exe
 
 # python bytecode
